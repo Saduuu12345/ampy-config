@@ -40,11 +40,11 @@ def duration_to_ms(s: str) -> int:
 
 def size_to_bytes(s: str) -> int:
     val = int(re.match(r'^([0-9]+)', s).group(1))
-    if s.endswith('B'): return val
-    if s.endswith('KiB'): return val*1024
-    if s.endswith('MiB'): return val*1024**2
-    if s.endswith('GiB'): return val*1024**3
     if s.endswith('TiB'): return val*1024**4
+    if s.endswith('GiB'): return val*1024**3
+    if s.endswith('MiB'): return val*1024**2
+    if s.endswith('KiB'): return val*1024
+    if s.endswith('B'): return val
     raise ValueError("bad size")
 
 def semantic_checks(cfg: Dict[str, Any]) -> None:
