@@ -1,0 +1,131 @@
+bus:
+  env: "prod"
+  cluster: "us-east-1/a"
+  transport: "nats"
+  topic_prefix: "ampy/prod"
+  compression_threshold: "128KiB"
+  max_payload_size: "1MiB"
+  qps_limits: { default: 1000, bars: 5000, ticks: 25000 }
+  retry: { policy: "exponential", base_backoff: "50ms", max_backoff: "2s", max_attempts: 6 }
+  dlq: { enabled: true, topic: "ampy/prod/dlq/v1/*" }
+  headers: { require_trace: true, schema_strict: true }
+  partitions: { bars: "symbol_mic", ticks: "symbol_mic", orders: "client_order_id", signals: "model_symbol_mic" }
+
+ingest:
+  yfinance:
+    enabled: true
+    golang_client: "github.com/AmpyFin/yfinance-go@^1"
+    http_timeout: "5s"
+    max_concurrency: 64
+    rate_limit_qps: 50
+    markets: ["XNYS","XNAS"]
+    symbols_include: []
+    symbols_exclude: []
+  tiingo:
+    enabled: true
+    api_token: "secret://vault/tiingo#token"
+    http_timeout: "5s"
+  databento:
+    enabled: true
+    sdk: "cpp"
+    streams:
+      - dataset: "XBBO"
+        symbols: ["AAPL","MSFT"]
+        book_depth: 5
+        heartbeat: "500ms"
+  marketbeat:
+    enabled: true
+    poll_interval: "30s"
+    dedupe_horizon: "3h"
+
+warehouse:
+  format: "parquet"
+  path: "s3://ampy-warehouse/prod/"
+  write_mode: "append"
+  compression: "zstd"
+  manifest_versioning: true
+  checkpoint_interval: "1m"
+
+ml:
+  model_server:
+    inference_timeout: "200ms"
+    max_batch: 256
+    warmup_signals: true
+    model_registry: "s3://ampy-models/prod/"
+    allowed_models: ["hyper@*", "prag@*", "baseline@*"]
+  ensemble:
+    strategy: "rank_weighted"
+    decay_half_life: "14d"
+    min_models: 2
+    max_models: 8
+    guardrails:
+      score_clip: [-1.0, 1.0]
+      expiry_default: "1d"
+
+oms:
+  risk:
+    max_notional_usd: 5000000
+    max_order_notional_usd: 100000
+    max_symbol_gross_exposure_usd: 2500000
+    max_drawdown_halt_bp: 300
+    news_halt_enabled: true
+    news_halt_sources: ["marketbeat"]
+  throt:
+    max_orders_per_min: 900
+    min_inter_order_delay: "20ms"
+  clock:
+    trading_calendar: "XNYS"
+    enforce_session: true
+  fail_policy: "fail_shut"
+
+broker:
+  alpaca:
+    enabled: true
+    base_url: "https://api.alpaca.markets"
+    key_id: "aws-sm://ALPACA_KEY?versionStage=AWSCURRENT"
+    secret_key: "aws-sm://ALPACA_SECRET?versionStage=AWSCURRENT"
+    recv_window: "2s"
+    order_timeout: "1s"
+    sandbox: false
+  ibkr:
+    enabled: false
+
+fx:
+  providers:
+    - { name: "provider_a", api_key: "secret://vault/fx#key", priority: 1 }
+    - { name: "provider_b", api_key: "secret://vault/fx_backup#key", priority: 2 }
+  cache_ttl: "2s"
+  pairs: ["USD/JPY","EUR/USD","USD/KRW"]
+  fallback_on_stale: true
+  max_staleness: "5s"
+
+feature_flags:
+  enable_mbp_depth: { type: "bool", value: false }
+  use_new_ensemble: { type: "bool", value: true, expires_at: "2025-12-31T23:59:59Z" }
+
+metrics:
+  exporter: "otlp"
+  endpoint: "https://otel.prod.ampyfin.com:4317"
+  sampling_ratio: 0.25
+
+logging:
+  level: "info"
+  json: true
+  redact_fields: ["*.secret", "*.api_key", "broker.alpaca.secret_key"]
+
+tracing:
+  enabled: true
+  propagate_traceparent: true
+
+security:
+  tls_required: true
+  mutual_tls: true
+  allowed_ciphers: ["TLS_AES_128_GCM_SHA256","TLS_AES_256_GCM_SHA384"]
+  acls:
+    - subject: "service:ampy-oms"
+      allow_publish: ["ampy/prod/orders/v1/requests"]
+      allow_consume: ["ampy/prod/signals/v1/*"]
+    - subject: "service:broker-alpaca"
+      allow_publish: ["ampy/prod/fills/v1/events"]
+      allow_consume: ["ampy/prod/orders/v1/requests"]
+  pii_policy: "forbid"

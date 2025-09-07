@@ -1,0 +1,116 @@
+{
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$id": "https://ampyfin.org/schemas/ampy-config.schema.json",
+    "title": "AmpyFin Config Schema (v1, draft)",
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "bus": {"$ref": "#/$defs/bus"},
+      "ingest": {"$ref": "#/$defs/ingest"},
+      "warehouse": {"$ref": "#/$defs/warehouse"},
+      "ml": {"$ref": "#/$defs/ml"},
+      "oms": {"$ref": "#/$defs/oms"},
+      "broker": {"$ref": "#/$defs/broker"},
+      "fx": {"$ref": "#/$defs/fx"},
+      "feature_flags": {"$ref": "#/$defs/feature_flags"},
+      "metrics": {"$ref": "#/$defs/metrics"},
+      "logging": {"$ref": "#/$defs/logging"},
+      "tracing": {"$ref": "#/$defs/tracing"},
+      "security": {"$ref": "#/$defs/security"}
+    },
+    "required": ["bus","ingest","warehouse","ml","oms","broker","fx","feature_flags","metrics","logging","tracing","security"],
+    "$defs": {
+      "duration": {"type": "string","pattern": "^[0-9]+(ms|s|m|h|d)$","description": "Duration with unit suffix: ms,s,m,h,d"},
+      "size": {"type": "string","pattern": "^[0-9]+(B|KiB|MiB|GiB|TiB)$","description": "Binary size with unit suffix: B,KiB,MiB,GiB,TiB"},
+      "bp_int": {"type": "integer","minimum": 0,"maximum": 10000,"description": "Basis points integer in [0,10000]"},
+      "uri_https": {"type": "string","pattern": "^https://","description": "HTTPS URL required"},
+      "iso8601": {"type": "string","pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$","description": "Basic ISO-8601 (UTC) timestamp e.g. 2025-09-05T16:12:30Z"},
+      "secret_ref": {"type": "string","pattern": "^(secret://|aws-sm://|gcp-sm://).+","description": "Reference to secret store (no plaintext)"},
+      "bus": {
+        "type": "object","additionalProperties": false,
+        "properties": {
+          "env": {"type": "string", "enum": ["dev","paper","prod"]},
+          "cluster": {"type": "string"},
+          "transport": {"type": "string", "enum": ["nats","kafka","inproc"]},
+          "topic_prefix": {"type": "string"},
+          "compression_threshold": {"$ref": "#/$defs/size"},
+          "max_payload_size": {"$ref": "#/$defs/size"},
+          "qps_limits": {"type": "object","additionalProperties": {"type":"integer","minimum":1}},
+          "retry": {
+            "type": "object","additionalProperties": false,
+            "properties": {"policy": {"type":"string","enum":["exponential","linear","none"]},"base_backoff": {"$ref":"#/$defs/duration"},"max_backoff": {"$ref":"#/$defs/duration"},"max_attempts": {"type":"integer","minimum":0}}
+          },
+          "dlq": {"type":"object","additionalProperties": false,"properties": {"enabled":{"type":"boolean"},"topic":{"type":"string"}}},
+          "headers": {"type":"object","additionalProperties": false,"properties": {"require_trace":{"type":"boolean"},"schema_strict":{"type":"boolean"}}},
+          "partitions": {"type":"object","additionalProperties": {"type":"string"},"properties": {"bars":{"type":"string"},"ticks":{"type":"string"},"orders":{"type":"string"},"signals":{"type":"string"}}}
+        },
+        "required": ["env","cluster","transport","topic_prefix","compression_threshold","max_payload_size"]
+      },
+      "ingest": {
+        "type": "object","additionalProperties": false,
+        "properties": {
+          "yfinance": {
+            "type":"object","additionalProperties": false,
+            "properties": {"enabled":{"type":"boolean"},"golang_client":{"type":"string"},"http_timeout":{"$ref":"#/$defs/duration"},"max_concurrency":{"type":"integer","minimum":1},"rate_limit_qps":{"type":"integer","minimum":1},"markets":{"type":"array","items":{"type":"string"}},"symbols_include":{"type":"array","items":{"type":"string"}},"symbols_exclude":{"type":"array","items":{"type":"string"}}},
+            "required": ["enabled"]
+          },
+          "tiingo": {
+            "type":"object","additionalProperties": false,
+            "properties": {"enabled":{"type":"boolean"},"api_token":{"$ref":"#/$defs/secret_ref"},"http_timeout":{"$ref":"#/$defs/duration"}},
+            "required": ["enabled"]
+          },
+          "databento": {
+            "type":"object","additionalProperties": false,
+            "properties": {"enabled":{"type":"boolean"},"sdk":{"type":"string","enum":["cpp","go"]},"streams":{"type":"array","items":{"type":"object","additionalProperties": false,"properties": {"dataset":{"type":"string"},"symbols":{"type":"array","items":{"type":"string"}},"book_depth":{"type":"integer","minimum":1},"heartbeat":{"$ref":"#/$defs/duration"}},"required":["dataset","symbols"]}}},
+            "required": ["enabled"]
+          },
+          "marketbeat": {
+            "type":"object","additionalProperties": false,
+            "properties": {"enabled":{"type":"boolean"},"poll_interval":{"$ref":"#/$defs/duration"},"dedupe_horizon":{"$ref":"#/$defs/duration"}},
+            "required": ["enabled"]
+          }
+        },
+        "required": ["yfinance","tiingo","databento","marketbeat"]
+      },
+      "warehouse": {"type":"object","additionalProperties": false,"properties": {"format":{"type":"string","enum":["parquet","orc"]},"path":{"type":"string"},"write_mode":{"type":"string","enum":["append","overwrite"]},"manifest_versioning":{"type":"boolean"},"checkpoint_interval":{"$ref":"#/$defs/duration"},"compression":{"type":"string","enum":["zstd","snappy","gzip"]}},"required": ["format","path","write_mode","compression"]},
+      "ml": {
+        "type":"object","additionalProperties": false,
+        "properties": {
+          "model_server":{"type":"object","additionalProperties": false,"properties":{"inference_timeout":{"$ref":"#/$defs/duration"},"max_batch":{"type":"integer","minimum":1},"warmup_signals":{"type":"boolean"},"model_registry":{"type":"string"},"allowed_models":{"type":"array","items":{"type":"string"}}},"required":["inference_timeout","max_batch","model_registry"]},
+          "ensemble":{"type":"object","additionalProperties": false,"properties":{"strategy":{"type":"string","enum":["rank_weighted","mean","median","vote"]},"decay_half_life":{"$ref":"#/$defs/duration"},"min_models":{"type":"integer","minimum":1},"max_models":{"type":"integer","minimum":1},"guardrails":{"type":"object","additionalProperties": false,"properties":{"score_clip":{"type":"array","items":{"type":"number"},"minItems":2,"maxItems":2},"expiry_default":{"$ref":"#/$defs/duration"}}}},"required":["strategy","min_models","max_models"]}
+        },
+        "required": ["model_server","ensemble"]
+      },
+      "oms": {
+        "type":"object","additionalProperties": false,
+        "properties":{"risk":{"type":"object","additionalProperties": false,"properties":{"max_notional_usd":{"type":"number","minimum":0},"max_order_notional_usd":{"type":"number","minimum":0},"max_symbol_gross_exposure_usd":{"type":"number","minimum":0},"max_drawdown_halt_bp":{"$ref":"#/$defs/bp_int"},"news_halt_enabled":{"type":"boolean"},"news_halt_sources":{"type":"array","items":{"type":"string"}}},"required":["max_drawdown_halt_bp"]},"throt":{"type":"object","additionalProperties": false,"properties":{"max_orders_per_min":{"type":"integer","minimum":1},"min_inter_order_delay":{"$ref":"#/$defs/duration"}}},"clock":{"type":"object","additionalProperties": false,"properties":{"trading_calendar":{"type":"string"},"enforce_session":{"type":"boolean"}}},"fail_policy":{"type":"string","enum":["fail_shut","fail_open"]}},
+        "required":["risk","fail_policy"]
+      },
+      "broker":{
+        "type":"object","additionalProperties": false,
+        "properties":{
+          "alpaca":{"type":"object","additionalProperties": false,"properties":{"enabled":{"type":"boolean"},"base_url":{"$ref":"#/$defs/uri_https"},"key_id":{"$ref":"#/$defs/secret_ref"},"secret_key":{"$ref":"#/$defs/secret_ref"},"recv_window":{"$ref":"#/$defs/duration"},"order_timeout":{"$ref":"#/$defs/duration"},"sandbox":{"type":"boolean"}},"required":["enabled"]},
+          "ibkr":{"type":"object","additionalProperties": false,"properties":{"enabled":{"type":"boolean"}},"required":["enabled"]}
+        },
+        "required":["alpaca","ibkr"]
+      },
+      "fx":{
+        "type":"object","additionalProperties": false,
+        "properties":{"providers":{"type":"array","items":{"type":"object","additionalProperties": false,"properties":{"name":{"type":"string"},"api_key":{"$ref":"#/$defs/secret_ref"},"priority":{"type":"integer","minimum":1}},"required":["name","api_key","priority"]}},"cache_ttl":{"$ref":"#/$defs/duration"},"pairs":{"type":"array","items":{"type":"string","pattern":"^[A-Z]{3}/[A-Z]{3}$"}},"fallback_on_stale":{"type":"boolean"},"max_staleness":{"$ref":"#/$defs/duration"}},
+        "required":["providers","pairs","cache_ttl"]
+      },
+      "feature_flags":{
+        "type":"object",
+        "additionalProperties": {
+          "type":"object","additionalProperties": false,
+          "properties":{"type":{"type":"string","enum":["bool","int","enum"]},"value":{},"allowed":{"type":"array","items":{}},"expires_at":{"$ref":"#/$defs/iso8601"}},
+          "required":["type","value"]
+        }
+      },
+      "metrics":{"type":"object","additionalProperties": false,"properties":{"exporter":{"type":"string","enum":["otlp","prom"]},"endpoint":{"type":"string"},"sampling_ratio":{"type":"number","minimum":0,"maximum":1}},"required":["exporter"]},
+      "logging":{"type":"object","additionalProperties": false,"properties":{"level":{"type":"string","enum":["debug","info","warn","error"]},"json":{"type":"boolean"},"redact_fields":{"type":"array","items":{"type":"string"}}},"required":["level"]},
+      "tracing":{"type":"object","additionalProperties": false,"properties":{"enabled":{"type":"boolean"},"propagate_traceparent":{"type":"boolean"}},"required":["enabled"]},
+      "security":{"type":"object","additionalProperties": false,"properties":{"tls_required":{"type":"boolean"},"mutual_tls":{"type":"boolean"},"allowed_ciphers":{"type":"array","items":{"type":"string"}},"acls":{"type":"array","items":{"type":"object","additionalProperties": false,"properties":{"subject":{"type":"string"},"allow_publish":{"type":"array","items":{"type":"string"}},"allow_consume":{"type":"array","items":{"type":"string"}}},"required":["subject"]}},"pii_policy":{"type":"string","enum":["forbid","allow"]}},"required":["tls_required","pii_policy"]}
+    }
+  }
+  

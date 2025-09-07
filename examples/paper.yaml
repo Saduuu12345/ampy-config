@@ -1,0 +1,125 @@
+# Same as dev with env/topic changes and log level tweaked
+bus:
+  env: "paper"
+  cluster: "us-east-1/a"
+  transport: "nats"
+  topic_prefix: "ampy/paper"
+  compression_threshold: "128KiB"
+  max_payload_size: "1MiB"
+  qps_limits: { default: 500, bars: 2000, ticks: 10000 }
+  retry: { policy: "exponential", base_backoff: "50ms", max_backoff: "2s", max_attempts: 6 }
+  dlq: { enabled: true, topic: "ampy/paper/dlq/v1/*" }
+  headers: { require_trace: true, schema_strict: true }
+  partitions: { bars: "symbol_mic", ticks: "symbol_mic", orders: "client_order_id", signals: "model_symbol_mic" }
+
+ingest:
+  yfinance:
+    enabled: true
+    golang_client: "github.com/AmpyFin/yfinance-go@^1"
+    http_timeout: "5s"
+    max_concurrency: 32
+    rate_limit_qps: 25
+    markets: ["XNYS","XNAS"]
+    symbols_include: ["AAPL","MSFT"]
+    symbols_exclude: []
+  tiingo:
+    enabled: false
+    api_token: "secret://vault/tiingo#token"
+    http_timeout: "5s"
+  databento:
+    enabled: false
+    sdk: "cpp"
+    streams: []
+  marketbeat:
+    enabled: true
+    poll_interval: "30s"
+    dedupe_horizon: "3h"
+
+warehouse:
+  format: "parquet"
+  path: "s3://ampy-warehouse/paper/"
+  write_mode: "append"
+  compression: "zstd"
+  manifest_versioning: true
+  checkpoint_interval: "1m"
+
+ml:
+  model_server:
+    inference_timeout: "300ms"
+    max_batch: 64
+    warmup_signals: true
+    model_registry: "s3://ampy-models/paper/"
+    allowed_models: ["hyper@*", "baseline@*"]
+  ensemble:
+    strategy: "rank_weighted"
+    decay_half_life: "14d"
+    min_models: 1
+    max_models: 4
+    guardrails:
+      score_clip: [-1.0, 1.0]
+      expiry_default: "1d"
+
+oms:
+  risk:
+    max_notional_usd: 1000000
+    max_order_notional_usd: 50000
+    max_symbol_gross_exposure_usd: 500000
+    max_drawdown_halt_bp: 300
+    news_halt_enabled: true
+    news_halt_sources: ["marketbeat"]
+  throt:
+    max_orders_per_min: 300
+    min_inter_order_delay: "20ms"
+  clock:
+    trading_calendar: "XNYS"
+    enforce_session: false
+  fail_policy: "fail_shut"
+
+broker:
+  alpaca:
+    enabled: true
+    base_url: "https://paper-api.alpaca.markets"
+    key_id: "aws-sm://ALPACA_KEY?versionStage=AWSCURRENT"
+    secret_key: "aws-sm://ALPACA_SECRET?versionStage=AWSCURRENT"
+    recv_window: "2s"
+    order_timeout: "1s"
+    sandbox: true
+  ibkr:
+    enabled: false
+
+fx:
+  providers:
+    - { name: "provider_a", api_key: "secret://vault/fx#key", priority: 1 }
+    - { name: "provider_b", api_key: "secret://vault/fx_backup#key", priority: 2 }
+  cache_ttl: "2s"
+  pairs: ["USD/JPY","EUR/USD","USD/KRW"]
+  fallback_on_stale: true
+  max_staleness: "5s"
+
+feature_flags:
+  enable_mbp_depth: { type: "bool", value: false }
+  use_new_ensemble: { type: "bool", value: true, expires_at: "2025-12-31T23:59:59Z" }
+
+metrics:
+  exporter: "otlp"
+  endpoint: "https://otel.paper.ampyfin.com:4317"
+  sampling_ratio: 0.5
+
+logging:
+  level: "info"
+  json: true
+  redact_fields: ["*.secret", "*.api_key", "broker.alpaca.secret_key"]
+
+tracing:
+  enabled: true
+  propagate_traceparent: true
+
+security:
+  tls_required: false
+  mutual_tls: false
+  allowed_ciphers: []
+  acls:
+    - subject: "service:ampy-research"
+      allow_publish: ["ampy/paper/signals/v1/*"]
+      allow_consume: ["ampy/paper/bars/v1/*"]
+  pii_policy: "forbid"
