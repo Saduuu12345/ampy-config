@@ -82,6 +82,7 @@ celerybeat.pid
 ENV/
 env/
 venv/
+.secrets.local.json
 
 # mypy
 .mypy_cache/
