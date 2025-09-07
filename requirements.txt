@@ -1,2 +1,5 @@
 pyyaml
 jsonschema
+hvac
+boto3
+google-cloud-secret-manager

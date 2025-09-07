@@ -29,26 +29,26 @@ def load_schema(p: pathlib.Path) -> Dict[str, Any]:
     with p.open() as f:
         return json.load(f)
 
-def duration_to_ms(s: str) -> int:
-    val = int(re.match(r'^([0-9]+)', s).group(1))
-    if s.endswith('ms'): return val
-    if s.endswith('s'): return val*1000
-    if s.endswith('m'): return val*60*1000
-    if s.endswith('h'): return val*60*60*1000
-    if s.endswith('d'): return val*24*60*60*1000
-    raise ValueError("bad duration")
+SIZE_UNITS = {"TiB": 1024**4, "GiB": 1024**3, "MiB": 1024**2, "KiB": 1024, "B": 1}
+DUR_UNITS  = {"ms": 1, "s": 1000, "m": 60_000, "h": 3_600_000, "d": 86_400_000}
 
 def size_to_bytes(s: str) -> int:
-    val = int(re.match(r'^([0-9]+)', s).group(1))
-    if s.endswith('TiB'): return val*1024**4
-    if s.endswith('GiB'): return val*1024**3
-    if s.endswith('MiB'): return val*1024**2
-    if s.endswith('KiB'): return val*1024
-    if s.endswith('B'): return val
-    raise ValueError("bad size")
+    m = re.fullmatch(r'(\d+)(TiB|GiB|MiB|KiB|B)', s)
+    if not m:
+        raise ValueError(f"bad size: {s!r}")
+    n, unit = m.groups()
+    return int(n) * SIZE_UNITS[unit]
+
+def duration_to_ms(s: str) -> int:
+    m = re.fullmatch(r'(\d+)(ms|s|m|h|d)', s)
+    if not m:
+        raise ValueError(f"bad duration: {s!r}")
+    n, unit = m.groups()
+    return int(n) * DUR_UNITS[unit]
+
 
 def semantic_checks(cfg: Dict[str, Any]) -> None:
-    # Cross-field constraints
+    # Existing checks
     comp = size_to_bytes(cfg["bus"]["compression_threshold"])
     maxp = size_to_bytes(cfg["bus"]["max_payload_size"])
     assert comp < maxp, "bus.compression_threshold must be < bus.max_payload_size"
@@ -59,6 +59,44 @@ def semantic_checks(cfg: Dict[str, Any]) -> None:
     if cfg["bus"]["env"] == "prod":
         delay = duration_to_ms(cfg["oms"]["throt"]["min_inter_order_delay"])
         assert delay >= 5, "prod: oms.throt.min_inter_order_delay must be >= 5ms"
+
+    # NEW: ensemble sanity
+    ens = cfg["ml"]["ensemble"]
+    assert ens["min_models"] <= ens["max_models"], "ml.ensemble.min_models must be <= max_models"
+
+    # NEW: feature_flags type/value coherence
+    for name, flag in (cfg.get("feature_flags") or {}).items():
+        t = flag.get("type")
+        v = flag.get("value")
+        if t == "bool":
+            assert isinstance(v, bool), f"feature_flags.{name}.value must be boolean"
+        elif t == "int":
+            assert isinstance(v, int), f"feature_flags.{name}.value must be integer"
+        elif t == "enum":
+            allowed = flag.get("allowed") or []
+            assert allowed, f"feature_flags.{name}.allowed must be set for enum"
+            assert v in allowed, f"feature_flags.{name}.value must be one of {allowed}"
+
+    # NEW: broker/alpaca required fields when enabled
+    alp = cfg["broker"]["alpaca"]
+    if alp.get("enabled"):
+        for req in ("base_url", "key_id", "secret_key"):
+            assert alp.get(req), f"broker.alpaca.{req} required when alpaca.enabled=true"
+        # Optional: sandbox/URL coherence
+        if alp.get("sandbox"):
+            assert "paper" in alp["base_url"], "alpaca.sandbox=true expects paper API base_url"
+        else:
+            assert "paper" not in alp["base_url"], "alpaca.sandbox=false expects live API base_url"
+
+    # NEW: FX providers unique priorities
+    prios = [p["priority"] for p in cfg["fx"]["providers"]]
+    assert len(prios) == len(set(prios)), "fx.providers priorities must be unique"
+
+    # NEW: databento enabled implies non-empty streams
+    db = cfg["ingest"]["databento"]
+    if db.get("enabled"):
+        assert db.get("streams"), "ingest.databento.streams must be non-empty when enabled"
+
 
 def main():
     ap = argparse.ArgumentParser()

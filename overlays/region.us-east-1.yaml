@@ -1,0 +1,4 @@
+bus:
+  cluster: "us-east-1/b"
+warehouse:
+  path: "s3://ampy-warehouse/${BUS_ENV:-dev}/"  # literal string; env interpolation can be added later

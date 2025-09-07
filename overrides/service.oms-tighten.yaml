@@ -1,0 +1,3 @@
+oms:
+  risk:
+    max_order_notional_usd: 70000

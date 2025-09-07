@@ -1,0 +1,4 @@
+feature_flags:
+  use_new_ensemble:
+    type: "bool"
+    value: false

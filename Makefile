@@ -1,3 +1,37 @@
 .PHONY: validate
 validate:
 	python3 tools/validate.py --schema schema/ampy-config.schema.json examples/dev.yaml examples/paper.yaml examples/prod.yaml
+
+PROFILE ?= dev
+OVERLAYS ?= overlays/region.us-east-1.yaml
+SERVICE_OVERRIDES ?= overrides/service.oms-tighten.yaml
+ENV_FILE ?= .env
+RUNTIME ?= runtime/overrides.yaml
+OUTPUT ?= effective.yaml
+
+.PHONY: effective
+effective:
+	python3 -m ampy_config.cli render --profile $(PROFILE) --overlay $(OVERLAYS) \
+		--service-override $(SERVICE_OVERRIDES) --env-file $(ENV_FILE) \
+		--env-allowlist env_allowlist.txt --runtime $(RUNTIME) \
+		--schema schema/ampy-config.schema.json --defaults config/defaults.yaml \
+		--provenance --output $(OUTPUT)
+
+.PHONY: effective-noenv
+effective-noenv:
+	python3 -m ampy_config.cli render --profile $(PROFILE) --overlay $(OVERLAYS) \
+		--service-override $(SERVICE_OVERRIDES) --env-allowlist env_allowlist.txt \
+		--schema schema/ampy-config.schema.json --defaults config/defaults.yaml \
+		--provenance --output $(OUTPUT)
+.PHONY: secret-get secret-rotate render-redacted render-values
+secret-get:
+	python3 -m ampy_config.cli secret get --plain $(REF)
+
+secret-rotate:
+	python3 -m ampy_config.cli secret rotate $(REF)
+
+render-redacted:
+	python3 -m ampy_config.cli render --profile $(PROFILE) --resolve-secrets redacted --provenance
+
+render-values:
+	python3 -m ampy_config.cli render --profile $(PROFILE) --resolve-secrets values --provenance
