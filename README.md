@@ -71,28 +71,83 @@ This README is **LLM‑ready**: it specifies what to build and how it should beh
 ## 5) Architecture (Logical)
 
 ```
-                ┌──────────────────────┐
-    Defaults ──▶│                      │
-   Profiles  ──▶│  Layering Engine     │──┐
- Region/Node ──▶│   (with provenance)  │  │  Effective
-      ENV   ──▶│                      │  │  Config (typed)
- Runtime Ov. ─▶└──────────────────────┘  │
-                                           ▼
-                                    ┌───────────────┐
-                                    │ Validation    │  (types, units, constraints,
-                                    │ & Safety      │   redaction policies)
-                                    └─────┬─────────┘
-                                          │
-                    Secrets refs           │ ok
-    secret://..., aws-sm://..., gcp-sm://… │
-                ┌───────────────┐         ▼
-                │ Secrets       │   ┌─────────────┐
-                │ Resolver      │◀──│  Audit      │  (immutable journal)
-                └───────────────┘   └─────────────┘
-                         ▲                 ▲
-                         │                 │
-                  SecretRotated      ConfigApply/Applied
-                  (ampy-bus)         (ampy-bus control topics)
+    ┌─────────────────────────────────────────────────────────────────┐
+    │                    Configuration Sources                        │
+    │  ┌─────────┐  ┌─────────┐  ┌─────────┐  ┌─────────┐  ┌─────────┐│
+    │  │Defaults │  │Profiles │  │Region/  │  │   ENV   │  │Runtime  ││
+    │  │         │  │(dev/    │  │Cluster  │  │Variables│  │Overrides││
+    │  │         │  │paper/   │  │Overlay  │  │         │  │         ││
+    │  │         │  │prod)    │  │         │  │         │  │         ││
+    │  └─────────┘  └─────────┘  └─────────┘  └─────────┘  └─────────┘│
+    └─────────────────────┬───────────────────────────────────────────┘
+                          │
+                          ▼
+    ┌─────────────────────────────────────────────────────────────────┐
+    │                  Layering Engine                                │
+    │              (with provenance tracking)                         │
+    │                                                                 │
+    │  ┌─────────────────────────────────────────────────────────────┐│
+    │  │              Effective Config Builder                       ││
+    │  │  • Merges layers in precedence order                       ││
+    │  │  • Tracks origin for each key                              ││
+    │  │  • Handles secret references                               ││
+    │  └─────────────────────────────────────────────────────────────┘│
+    └─────────────────────┬───────────────────────────────────────────┘
+                          │
+                          ▼
+    ┌─────────────────────────────────────────────────────────────────┐
+    │                Validation & Safety Engine                       │
+    │  ┌─────────────────────────────────────────────────────────────┐│
+    │  │  • Type validation (durations, sizes, ratios)              ││
+    │  │  • Constraint checking (ranges, relationships)             ││
+    │  │  • Safety classification (critical/risky/safe)             ││
+    │  │  • Redaction policy enforcement                             ││
+    │  └─────────────────────────────────────────────────────────────┘│
+    └─────────────────────┬───────────────────────────────────────────┘
+                          │
+                          ▼
+    ┌─────────────────────────────────────────────────────────────────┐
+    │                    Secrets Resolver                             │
+    │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐             │
+    │  │   Vault     │  │  AWS SM     │  │   GCP SM    │             │
+    │  │secret://... │  │aws-sm://... │  │gcp-sm://... │             │
+    │  └─────────────┘  └─────────────┘  └─────────────┘             │
+    │  • TTL-based caching                                            │
+    │  • Rotation event handling                                      │
+    │  • Redaction in logs/metrics                                    │
+    └─────────────────────┬───────────────────────────────────────────┘
+                          │
+                          ▼
+    ┌─────────────────────────────────────────────────────────────────┐
+    │                    Runtime Reload Orchestrator                  │
+    │  ┌─────────────────────────────────────────────────────────────┐│
+    │  │  Preview → Apply → Confirm Flow                             ││
+    │  │  • Canary rollouts                                          ││
+    │  │  • Automatic rollback on failure                            ││
+    │  │  • Deadline enforcement                                     ││
+    │  └─────────────────────────────────────────────────────────────┘│
+    └─────────────────────┬───────────────────────────────────────────┘
+                          │
+                          ▼
+    ┌─────────────────────────────────────────────────────────────────┐
+    │                      Audit & Observability                     │
+    │  ┌─────────────────────────────────────────────────────────────┐│
+    │  │  • Immutable change journal                                ││
+    │  │  • Metrics (load/reload/resolve latency)                   ││
+    │  │  • Structured logs with redaction                          ││
+    │  │  • Distributed tracing                                     ││
+    │  │  • Point-in-time config materialization                    ││
+    │  └─────────────────────────────────────────────────────────────┘│
+    └─────────────────────────────────────────────────────────────────┘
+                          ▲
+                          │
+    ┌─────────────────────┴───────────────────────────────────────────┐
+    │                    ampy-bus Control Topics                      │
+    │  • ConfigPreviewRequested                                       │
+    │  • ConfigApply / ConfigApplied                                  │
+    │  • SecretRotated                                                │
+    │  • ConfigRejected                                               │
+    └─────────────────────────────────────────────────────────────────┘
 ```
 
 **Key properties**
