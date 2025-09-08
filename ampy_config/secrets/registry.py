@@ -1,6 +1,7 @@
 from __future__ import annotations
 import os, re, json, time, threading, pathlib
 from typing import Dict, Tuple, Optional, List, Callable
+
 # -------- parsing
 
 REF_RE = re.compile(r'^(?P<scheme>[a-z0-9\-]+)://(?P<body>.+)$')
@@ -62,28 +63,31 @@ class LocalFileResolver:
             raise RuntimeError(f"Secret not found in local secrets file: {ref}")
         return str(data[ref])
 
-# -------- vault resolver (optional hvac)
+# -------- vault resolver (lazy hvac)
 
 class VaultResolver:
     scheme = "secret"  # refs like secret://vault/path#key
 
     def __init__(self):
+        self._client = None
+        self._err = None
+
+    def _ensure(self):
+        if self._client or self._err:
+            return
         try:
             import hvac  # type: ignore
+            addr = os.environ.get("VAULT_ADDR", "http://127.0.0.1:8200")
+            token = os.environ.get("VAULT_TOKEN")
+            if not token:
+                self._err = "VAULT_TOKEN not set"
+                return
+            self._client = hvac.Client(url=addr, token=token)
         except Exception as e:
-            self._err = f"hvac not installed ({e}); pip install hvac"
-            self._client = None
-            return
-        self._err = None
-        addr = os.environ.get("VAULT_ADDR", "http://127.0.0.1:8200")
-        token = os.environ.get("VAULT_TOKEN")
-        if not token:
-            self._err = "VAULT_TOKEN not set"
-            self._client = None
-            return
-        self._client = hvac.Client(url=addr, token=token)
+            self._err = f"hvac not available/init failed: {e}"
 
     def resolve(self, ref: str) -> str:
+        self._ensure()
         if self._client is None:
             raise RuntimeError(self._err or "Vault client unavailable")
         # secret://vault/path#key
@@ -102,32 +106,36 @@ class VaultResolver:
                 raise KeyError(key)
             return str(data[key])
         except Exception:
-            # fallback raw (kv v1)
             resp = self._client.read(path)
             if not resp or "data" not in resp or key not in resp["data"]:
                 raise RuntimeError(f"Vault secret not found: path={path} key={key}")
             return str(resp["data"][key])
 
-# -------- aws sm resolver (optional boto3)
+# -------- aws sm resolver (lazy boto3, fast-fail)
 
 class AwsSMResolver:
     scheme = "aws-sm"  # aws-sm://NAME?versionStage=AWSCURRENT
 
     def __init__(self):
+        self._client = None
+        self._err = None
+
+    def _ensure(self):
+        if self._client or self._err:
+            return
+        # Avoid IMDS probe hangs on laptops/CI
+        os.environ.setdefault("AWS_EC2_METADATA_DISABLED", "true")
         try:
             import boto3  # type: ignore
+            from botocore.config import Config as BotoConfig  # type: ignore
+            region = os.environ.get("AWS_DEFAULT_REGION") or os.environ.get("AWS_REGION") or "us-east-1"
+            cfg = BotoConfig(connect_timeout=2, read_timeout=2, retries={'max_attempts': 2})
+            self._client = boto3.client("secretsmanager", region_name=region, config=cfg)
         except Exception as e:
-            self._err = f"boto3 not installed ({e}); pip install boto3"
-            self._client = None
-            return
-        try:
-            self._client = boto3.client("secretsmanager")
-            self._err = None
-        except Exception as e:
-            self._err = f"AWS credentials not configured ({e}); set AWS_DEFAULT_REGION and credentials"
-            self._client = None
+            self._err = f"AWS SM init failed: {e}"
 
     def resolve(self, ref: str) -> str:
+        self._ensure()
         if self._client is None:
             raise RuntimeError(self._err or "AWS SM client unavailable")
         body = ref.split("://", 1)[1]
@@ -142,36 +150,33 @@ class AwsSMResolver:
             resp = self._client.get_secret_value(SecretId=name, VersionStage=stage)
             if "SecretString" in resp:
                 return resp["SecretString"]
-            # binary fallback
             return resp["SecretBinary"].decode("utf-8")
         except Exception as e:
             raise RuntimeError(f"AWS SM error for {name}: {e}")
 
-# -------- gcp secret manager resolver (optional google-cloud-secret-manager)
+# -------- gcp secret manager resolver (lazy client)
 
 class GcpSMResolver:
     scheme = "gcp-sm"  # gcp-sm://projects/ID/secrets/NAME/versions/latest
 
     def __init__(self):
-        try:
-            from google.cloud import secretmanager  # type: ignore
-        except Exception as e:
-            self._err = f"google-cloud-secret-manager not installed ({e}); pip install google-cloud-secret-manager"
-            self._client = None
+        self._client = None
+        self._err = None
+
+    def _ensure(self):
+        if self._client or self._err:
             return
         try:
-            from google.cloud import secretmanager
+            from google.cloud import secretmanager  # type: ignore
             self._client = secretmanager.SecretManagerServiceClient()
-            self._err = None
         except Exception as e:
-            self._err = f"GCP credentials not configured ({e}); set GOOGLE_APPLICATION_CREDENTIALS"
-            self._client = None
+            self._err = f"GCP SM init failed (credentials or lib missing): {e}"
 
     def resolve(self, ref: str) -> str:
+        self._ensure()
         if self._client is None:
             raise RuntimeError(self._err or "GCP SM client unavailable")
-        body = ref.split("://", 1)[1]
-        name = body  # already full resource path after scheme
+        name = ref.split("://", 1)[1]
         try:
             resp = self._client.access_secret_version(request={"name": name})
             return resp.payload.data.decode("utf-8")
@@ -183,45 +188,63 @@ class GcpSMResolver:
 REDACTION = "***"
 
 class SecretsManager:
-    def __init__(self, ttl_ms: Optional[int] = None, enable_local_fallback: bool = True, local_path: Optional[str] = None):
+    """
+    Lazy, opt-in resolvers. Control which backends are enabled with:
+      AMPY_CONFIG_SECRET_RESOLVERS="local,secret,aws-sm,gcp-sm"
+    For dev, use: AMPY_CONFIG_SECRET_RESOLVERS="local"
+    """
+    def __init__(
+        self,
+        ttl_ms: Optional[int] = None,
+        enable_local_fallback: bool = True,
+        local_path: Optional[str] = None,
+        resolvers: Optional[List[str]] = None,
+    ):
         ttl = ttl_ms if ttl_ms is not None else int(os.environ.get("AMPY_CONFIG_SECRET_TTL_MS", "120000"))
         self.cache = SecretsCache(ttl_ms=ttl)
         self.local = LocalFileResolver(local_path) if enable_local_fallback else None
-        # Order matters: cache -> cloud providers -> local (dev)
-        self._resolvers = [
-            VaultResolver(),
-            AwsSMResolver(),
-            GcpSMResolver(),
-        ]
+
+        wanted = resolvers or os.environ.get("AMPY_CONFIG_SECRET_RESOLVERS", "local,secret,aws-sm,gcp-sm").split(",")
+        wanted = [w.strip() for w in wanted if w.strip()]
+
+        self._factories: Dict[str, Callable[[], object]] = {}
+        for name in wanted:
+            if name == "secret":   self._factories["secret"] = VaultResolver
+            elif name == "aws-sm": self._factories["aws-sm"] = AwsSMResolver
+            elif name == "gcp-sm": self._factories["gcp-sm"] = GcpSMResolver
+            elif name == "local":  pass  # handled as fallback
+        self._instances: Dict[str, object] = {}
+
+    def _get_resolver(self, scheme: str):
+        if scheme in self._instances:
+            return self._instances[scheme]
+        fac = self._factories.get(scheme)
+        if not fac:
+            return None
+        inst = fac()
+        self._instances[scheme] = inst
+        return inst
 
     def resolve(self, ref: str, use_cache: bool = True) -> str:
         if use_cache:
             cached = self.cache.get(ref)
             if cached is not None:
                 return cached
+
         scheme, _ = parse_ref(ref)
         errors: List[str] = []
 
-        # try scheme-matched resolver first
-        for r in self._resolvers:
-            if getattr(r, "scheme", None) == scheme:
-                try:
-                    val = r.resolve(ref)
-                    self.cache.put(ref, val)
-                    return val
-                except Exception as e:
-                    errors.append(f"{scheme}: {e}")
-                    break
-        # scheme not matched or failed → try all resolvers as fallback
-        for r in self._resolvers:
+        # Try scheme-matched resolver only
+        r = self._get_resolver(scheme)
+        if r:
             try:
-                val = r.resolve(ref)
+                val = r.resolve(ref)  # type: ignore[attr-defined]
                 self.cache.put(ref, val)
                 return val
             except Exception as e:
-                errors.append(f"{getattr(r,'scheme','?')}: {e}")
+                errors.append(f"{scheme}: {e}")
 
-        # dev/local fallback
+        # Dev/local fallback
         if self.local:
             try:
                 val = self.local.resolve(ref)
@@ -235,7 +258,6 @@ class SecretsManager:
     def invalidate(self, ref: str):
         self.cache.invalidate(ref)
 
-    # utilities for config hydration (use with caution)
     def redact(self, value: str) -> str:
         return REDACTION
 

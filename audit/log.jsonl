@@ -1,3 +1,5 @@
 {"change_id":"chg_20250908_030553","diff":{"oms.risk.max_order_notional_usd":77777},"errors":null,"event":"ConfigApply","producer":"ops-cli@1","run_id":null,"status":"ok","ts":"2025-09-08T03:05:53+00:00Z"}
 {"change_id":"chg_20250908_030942","diff":{"oms.risk.max_order_notional_usd":77777},"errors":null,"event":"ConfigApply","producer":"ops-cli@1","run_id":null,"status":"ok","ts":"2025-09-08T03:09:42+00:00Z"}
 {"change_id":"chg_20250908_031018","diff":{"oms.risk.max_order_notional_usd":77778},"errors":null,"event":"ConfigApply","producer":"ops-cli@1","run_id":null,"status":"ok","ts":"2025-09-08T03:10:18+00:00Z"}
+{"change_id":"chg_20250908_032652","diff":{"oms.risk.max_order_notional_usd":88888},"errors":null,"event":"ConfigApply","producer":"ops-cli@1","run_id":null,"status":"ok","ts":"2025-09-08T03:26:52+00:00Z"}
+{"change_id":"chg_20250908_032821","diff":{"oms.risk.max_order_notional_usd":88888},"errors":null,"event":"ConfigApply","producer":"ops-cli@1","run_id":null,"status":"ok","ts":"2025-09-08T03:28:21+00:00Z"}
