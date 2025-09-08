@@ -4,7 +4,6 @@ import os, threading, asyncio, yaml, pathlib, datetime, copy
 from typing import Any, Dict, Callable, List, Optional, Tuple
 
 from ..layering import build_effective_config
-from ..bus.ampy_bus import AmpyBus as Bus
 from ..control.events import subjects, ConfigApplied
 
 def _utc_now() -> str:
@@ -130,6 +129,8 @@ class ConfigRuntime:
         topic_prefix = self._cfg["bus"]["topic_prefix"]
         subs = subjects(topic_prefix)
 
+        # Lazy import to avoid requiring ampybus when not using bus functionality
+        from ..bus.ampy_bus import AmpyBus as Bus
         bus = Bus(self.bus_url)
         await bus.connect()
 
