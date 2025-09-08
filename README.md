@@ -1,542 +1,364 @@
-# ampy-config — Typed Configuration & Secrets Façade (Open Source)
+# ampy-config — Typed Configuration & Secrets Façade
 
-> **Mission:** Provide a **single, consistent, transport‑agnostic configuration layer** for all AmpyFin services. `ampy-config` defines how configuration is **declared, layered, validated, resolved (incl. secrets), reloaded, audited, and observed** across environments—so modules built with **`ampy-proto`** (payload contracts) and **`ampy-bus`** (messaging rules) can run safely and predictably without per‑service, ad‑hoc config.
-
-This README is **LLM‑ready**: it specifies what to build and how it should behave, without prescribing repository structure or leaking implementation code. It includes **rich, concrete examples** to guide design decisions and validation logic.
-
----
-
-## 0) Status & Scope
-
-- **Status:** Spec complete / implementation unstarted.
-- **Artifact:** Library (Go + Python façade; optional adapters for secret stores).
-- **Open Source:** Yes (permissive license preferred).
-- **Integrations:** `ampy-proto` for typed envelopes; `ampy-bus` for control‑plane events (preview/apply/confirm), plus adapters for secret stores (Vault, AWS Secrets Manager / KMS, Google Secret Manager).
-
-**Out of scope (here):** Broker‑specific SDKs, message broker clients, concrete repo layout, infra code, or product‑specific business logic.
+> Single, safe source of truth for configuration and secrets across AmpyFin services.  
+> Built to integrate with **ampy-bus** (control plane over NATS/JetStream) and **ampy-proto** (payload contracts).
 
 ---
 
-## 1) Problem Statement (What this solves)
+## Why this exists (the problem)
 
-1. **Config sprawl & drift** — Each service invents its own flags/ENV layout; values diverge across `dev`/`paper`/`prod`.
-2. **Secrets hygiene** — Keys/tokens leak via logs or “.env” files; rotation is ad‑hoc and risky.
-3. **Reload inconsistency** — Some services require restarts; others ignore changes; no audit of who changed what, when, and why.
-4. **Non‑reproducibility** — Incidents cannot be reconstructed because the **effective config** at time *T* isn’t recorded.
-5. **Safety gaps** — Risk‑critical knobs (OMS limits) can be mis‑set without guardrails or staged rollout.
+Without a unified configuration layer, distributed trading systems tend to develop:
 
-**Thesis:** A typed, layered, and observable config façade prevents class‑wide incidents and accelerates safe delivery.
+- **ENV/YAML sprawl** → drift, surprises, outages.
+- **Secret handling risks** → credentials in logs, brittle rotations, no redaction.
+- **Non-reproducibility** → can’t reconstruct exactly which parameters were live for a given trade/run.
+- **Inconsistent runtime behavior** → some services reload, others require restarts.
 
----
-
-## 2) Design Goals (and Non‑Goals)
-
-### Goals
-- **Typed, validated config**: Every key has type, units, constraints, default, and safety classification.
-- **Layered precedence**: Defaults → environment profile → region/cluster overlay → service override → ENV → runtime overrides.
-- **Secrets separation**: Indirection to secret stores, redaction in logs/metrics, TTL‑based caching, and rotation.
-- **Runtime reloads**: Transactional preview/apply/confirm flow via `ampy-bus` control topics; canary rollouts.
-- **Auditability**: Immutable change journal linking actor, diff, validation result, rollout, and affected services.
-- **Observability**: Metrics, logs, traces for load/resolve/rotate/reload outcomes.
-- **Reproducibility**: Ability to materialize the exact **effective config** for a given run_id and timestamp.
-
-### Non‑Goals
-- Defining repository layout or build tooling.
-- Shipping broker or cloud vendor SDKs in this module.
-- Implementing business logic; `ampy-config` is purely a configuration/secret façade.
+**ampy-config** provides a single, typed, validated, observable configuration view with clean secret indirection and a runtime control plane for safe updates.
 
 ---
 
-## 3) Relationship to `ampy-proto` and `ampy-bus`
+## Highlights (what you get)
 
-- **`ampy-proto`**: Provides the canonical envelope and header contracts used by control‑plane events (`ConfigPreviewRequested`, `ConfigApply`, `ConfigApplied`, `SecretRotated`). `ampy-config` **describes** those payload shapes and consumes/produces them but does not define protobuf files itself.
-- **`ampy-bus`**: Supplies messaging semantics (topics, headers, partitions, DLQ, tracing propagation). `ampy-config` relies on `ampy-bus` control topics to coordinate configuration preview/apply/confirm and secret rotation signals.
-
-**Result:** Services get a uniform config API, while control‑plane changes are transported and audited through the existing bus infrastructure.
-
----
-
-## 4) Responsibilities (What `ampy-config` must do)
-
-1. **Schema Registry (conceptual)** — Defines the typed keyspace with constraints, defaults, units, and redaction policy.
-2. **Layering Engine** — Computes effective view with provenance for every key.
-3. **Secrets Resolver** — Resolves `secret://` references at load‑time or use‑time; caches with TTL; redacts everywhere.
-4. **Reload Orchestrator** — Applies preview/apply/confirm, supports canary % and deadlines, publishes/consumes control events.
-5. **Audit Writer** — Records immutable change events and diffs; links to run_id, commit, and rollout status.
-6. **Observability Hooks** — Exposes metrics/logs/traces for load/resolve/rotate/reload outcomes and redactions.
-7. **Safety Policies** — Enforces fail‑shut/open per domain; quarantines unknown keys; rate‑limits churn.
+- **Typed schema + validation**: JSON Schema + semantic cross-field checks.
+- **Layering & precedence**: defaults → environment profile → overlays → ENV allowlist → runtime overrides.
+- **Secret indirection**: `secret://…`, `aws-sm://…`, `gcp-sm://…` with caching, rotation, and universal redaction.
+- **Control plane for updates**: `config_preview` → `config_apply` → `config_applied` events on NATS (JetStream).
+- **Auditability & observability hooks**: provenance for each key; logs/metrics/traces (no secrets).
+- **Language-agnostic**: produces plain YAML effective config for Python, Go, C++, etc.
 
 ---
 
-## 5) Architecture (Logical)
+## Install (Python / PyPI)
 
-```
-    ┌─────────────────────────────────────────────────────────────────┐
-    │                    Configuration Sources                        │
-    │  ┌─────────┐  ┌─────────┐  ┌─────────┐  ┌─────────┐  ┌─────────┐│
-    │  │Defaults │  │Profiles │  │Region/  │  │   ENV   │  │Runtime  ││
-    │  │         │  │(dev/    │  │Cluster  │  │Variables│  │Overrides││
-    │  │         │  │paper/   │  │Overlay  │  │         │  │         ││
-    │  │         │  │prod)    │  │         │  │         │  │         ││
-    │  └─────────┘  └─────────┘  └─────────┘  └─────────┘  └─────────┘│
-    └─────────────────────┬───────────────────────────────────────────┘
-                          │
-                          ▼
-    ┌─────────────────────────────────────────────────────────────────┐
-    │                  Layering Engine                                │
-    │              (with provenance tracking)                         │
-    │                                                                 │
-    │  ┌─────────────────────────────────────────────────────────────┐│
-    │  │              Effective Config Builder                       ││
-    │  │  • Merges layers in precedence order                       ││
-    │  │  • Tracks origin for each key                              ││
-    │  │  • Handles secret references                               ││
-    │  └─────────────────────────────────────────────────────────────┘│
-    └─────────────────────┬───────────────────────────────────────────┘
-                          │
-                          ▼
-    ┌─────────────────────────────────────────────────────────────────┐
-    │                Validation & Safety Engine                       │
-    │  ┌─────────────────────────────────────────────────────────────┐│
-    │  │  • Type validation (durations, sizes, ratios)              ││
-    │  │  • Constraint checking (ranges, relationships)             ││
-    │  │  • Safety classification (critical/risky/safe)             ││
-    │  │  • Redaction policy enforcement                             ││
-    │  └─────────────────────────────────────────────────────────────┘│
-    └─────────────────────┬───────────────────────────────────────────┘
-                          │
-                          ▼
-    ┌─────────────────────────────────────────────────────────────────┐
-    │                    Secrets Resolver                             │
-    │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐             │
-    │  │   Vault     │  │  AWS SM     │  │   GCP SM    │             │
-    │  │secret://... │  │aws-sm://... │  │gcp-sm://... │             │
-    │  └─────────────┘  └─────────────┘  └─────────────┘             │
-    │  • TTL-based caching                                            │
-    │  • Rotation event handling                                      │
-    │  • Redaction in logs/metrics                                    │
-    └─────────────────────┬───────────────────────────────────────────┘
-                          │
-                          ▼
-    ┌─────────────────────────────────────────────────────────────────┐
-    │                    Runtime Reload Orchestrator                  │
-    │  ┌─────────────────────────────────────────────────────────────┐│
-    │  │  Preview → Apply → Confirm Flow                             ││
-    │  │  • Canary rollouts                                          ││
-    │  │  • Automatic rollback on failure                            ││
-    │  │  • Deadline enforcement                                     ││
-    │  └─────────────────────────────────────────────────────────────┘│
-    └─────────────────────┬───────────────────────────────────────────┘
-                          │
-                          ▼
-    ┌─────────────────────────────────────────────────────────────────┐
-    │                      Audit & Observability                     │
-    │  ┌─────────────────────────────────────────────────────────────┐│
-    │  │  • Immutable change journal                                ││
-    │  │  • Metrics (load/reload/resolve latency)                   ││
-    │  │  • Structured logs with redaction                          ││
-    │  │  • Distributed tracing                                     ││
-    │  │  • Point-in-time config materialization                    ││
-    │  └─────────────────────────────────────────────────────────────┘│
-    └─────────────────────────────────────────────────────────────────┘
-                          ▲
-                          │
-    ┌─────────────────────┴───────────────────────────────────────────┐
-    │                    ampy-bus Control Topics                      │
-    │  • ConfigPreviewRequested                                       │
-    │  • ConfigApply / ConfigApplied                                  │
-    │  • SecretRotated                                                │
-    │  • ConfigRejected                                               │
-    └─────────────────────────────────────────────────────────────────┘
+```bash
+pip install ampy-config
 ```
 
-**Key properties**
-- Every key retains **origin lineage** (which layer last set it).
-- **Transactional reloads**: build candidate → validate → canary apply → confirm/rollback.
-- **Strict redaction**: secrets never appear in logs/metrics/traces.
+Developer mode (local repo):
+
+```bash
+pip install -e .
+```
+
+### Optional secret backends
+
+```bash
+# HashiCorp Vault
+pip install hvac
+
+# AWS Secrets Manager
+pip install boto3
+
+# GCP Secret Manager
+pip install google-cloud-secret-manager
+```
+
+> You **do not** need to sign up for all of these. Choose one or more real backends for your deployment; the library gracefully falls back to a local JSON file in development.
 
 ---
 
-## 6) Conventions & Types (apply to all keys)
+## Control plane (NATS/JetStream)
 
-- **Namespacing**: `bus.*`, `ingest.*`, `warehouse.*`, `ml.*`, `oms.*`, `broker.*`, `fx.*`, `feature_flags.*`, `metrics.*`, `logging.*`, `tracing.*`, `security.*`.
-- **Durations** as strings with units: `150ms`, `2s`, `5m`, `1h`.
-- **Sizes** as strings with units: `512KiB`, `1MiB`, `10GB`.
-- **Ratios / bps** explicit: `orders.max_reject_rate_bp=50` → 0.50%.
-- **Time** is **UTC** / ISO‑8601 only.
-- **Safety classification** per key: `critical`, `risky`, `safe`.
-- **Redaction policy** per key: `public`, `sensitive`, `secret`.
+Start a local NATS with JetStream:
+
+```bash
+docker run --rm -d --name nats -p 4222:4222 nats:2.10 -js
+export NATS_URL="nats://127.0.0.1:4222"
+```
+
+Provision the stream and durable consumers (once). Using the `nats` CLI:
+
+```bash
+# Stream to cover all control-plane subjects
+nats --server "$NATS_URL" stream add ampy-control   --subjects "ampy.*.control.v1.*"   --retention limits --max-age 24h --storage file   --max-msgs 10000 --max-bytes 100MB --discard old --defaults
+
+# Agent durables (pull + explicit ack)
+nats --server "$NATS_URL" consumer add ampy-control ampy-config-agent-ampy-dev-control-v1-config-preview   --filter "ampy.dev.control.v1.config_preview" --pull --deliver all --ack explicit --defaults
+nats --server "$NATS_URL" consumer add ampy-control ampy-config-agent-ampy-dev-control-v1-config-apply   --filter "ampy.dev.control.v1.config_apply" --pull --deliver all --ack explicit --defaults
+nats --server "$NATS_URL" consumer add ampy-control ampy-config-agent-ampy-dev-control-v1-secret-rotated   --filter "ampy.dev.control.v1.secret_rotated" --pull --deliver all --ack explicit --defaults
+```
+
+Verify:
+
+```bash
+nats --server "$NATS_URL" stream ls
+nats --server "$NATS_URL" consumer ls ampy-control
+```
+
+> The library can also auto-provision if permitted, but explicit creation is more predictable for local dev and CI.
 
 ---
 
-## 7) Precedence & Layering
+## Layering model
 
-1) **Defaults** (checked into config registry)  
-2) **Environment profile** (`dev` / `paper` / `prod`)  
-3) **Region/cluster overlay** (e.g., `us-east-1/a`)  
-4) **Service instance override** (optional)  
-5) **ENV variables** (explicit mapping)  
-6) **Runtime overrides** (temporary; expire or are reverted)
+Effective config = **merge** in this order (later overrides earlier):
 
-**Provenance:** Each key exposes its source and version (e.g., `prod.us-east-1.overlay@sha256:...`).
+1. **Defaults** (checked in) — `config/defaults.yaml`  
+2. **Environment profile** — `examples/dev.yaml`, `examples/paper.yaml`, `examples/prod.yaml`  
+3. **Overlays** — region/cluster/service YAMLs (`--overlay path`, repeatable)  
+4. **ENV allowlist** — `env_allowlist.txt` maps allowed env keys into config  
+5. **Runtime overrides** — `runtime/overrides.yaml` (written by the agent on `config_apply`)
 
----
+Each key tracks **provenance**: where it came from (defaults/profile/overlay/ENV/runtime).
 
-## 8) Domain Catalog & Example Keys (illustrative)
+### Units & types
 
-> Examples show shape/semantics only; values are placeholders. Secrets are references, not literals.
-
-### 8.1 Bus (aligns with `ampy-bus`)
-```yaml
-bus:
-  env: "prod"
-  cluster: "us-east-1/a"
-  transport: "nats"        # "kafka" | "nats" | "inproc"
-  topic_prefix: "ampy/prod"
-  compression_threshold: "128KiB"
-  max_payload_size: "1MiB"
-  headers:
-    require_trace: true
-    schema_strict: true
-  partitions:
-    bars: "symbol_mic"
-    ticks: "symbol_mic"
-    orders: "client_order_id"
-```
-
-### 8.2 Ingestion connectors (Databento, Tiingo, yfinance, Marketbeat/news)
-```yaml
-ingest:
-  databento:
-    enabled: true
-    sdk: "cpp"
-    streams:
-      - dataset: "XBBO"
-        symbols: ["AAPL","MSFT"]
-        book_depth: 5
-        heartbeat: "500ms"
-  tiingo:
-    enabled: false
-    api_token: "secret://vault/tiingo#token"
-    http_timeout: "5s"
-  yfinance:
-    enabled: true
-    golang_client: "github.com/AmpyFin/yfinance-go@^1" # conceptual; OSS goal
-    http_timeout: "5s"
-    max_concurrency: 64
-    rate_limit_qps: 50
-    markets: ["XNYS","XNAS"]
-  marketbeat:
-    enabled: true
-    poll_interval: "30s"
-    dedupe_horizon: "3h"
-```
-
-### 8.3 Warehouse & storage
-```yaml
-warehouse:
-  format: "parquet"
-  path: "s3://ampy-warehouse/prod/"
-  write_mode: "append"
-  compression: "zstd"
-  manifest_versioning: true
-  checkpoint_interval: "1m"
-```
-
-### 8.4 ML model server & ensemble
-```yaml
-ml:
-  model_server:
-    inference_timeout: "200ms"
-    max_batch: 256
-    warmup_signals: true
-    model_registry: "s3://ampy-models/prod/"
-    allowed_models: ["hyper@*", "prag@*", "baseline@*"]
-  ensemble:
-    strategy: "rank_weighted"
-    decay_half_life: "14d"
-    min_models: 2
-    max_models: 8
-    guardrails:
-      score_clip: [-1.0, 1.0]
-      expiry_default: "1d"
-```
-
-### 8.5 OMS & execution (safety‑critical)
-```yaml
-oms:
-  risk:
-    max_notional_usd: 5000000
-    max_order_notional_usd: 100000
-    max_symbol_gross_exposure_usd: 2500000
-    max_drawdown_halt_bp: 300
-    news_halt_enabled: true
-    news_halt_sources: ["marketbeat"]
-  throt:
-    max_orders_per_min: 900
-    min_inter_order_delay: "20ms"
-  clock:
-    trading_calendar: "XNYS"
-    enforce_session: true
-  fail_policy: "fail_shut"
-```
-
-### 8.6 Broker connectors
-```yaml
-broker:
-  alpaca:
-    enabled: true
-    base_url: "https://api.alpaca.markets"
-    key_id: "secret://aws-sm/ALPACA_KEY#value"
-    secret_key: "secret://aws-sm/ALPACA_SECRET#value"
-    recv_window: "2s"
-    order_timeout: "1s"
-    sandbox: false
-  ibkr:
-    enabled: false
-```
-
-### 8.7 FX & currency normalization (incl. real‑time conversion cache)
-```yaml
-fx:
-  providers:
-    - name: "provider_a"
-      api_key: "secret://vault/fx#key"
-      priority: 1
-    - name: "provider_b"
-      api_key: "secret://vault/fx_backup#key"
-      priority: 2
-  cache_ttl: "2s"
-  pairs: ["USD/JPY","EUR/USD","USD/KRW"]
-  fallback_on_stale: true
-  max_staleness: "5s"
-```
-
-### 8.8 Feature flags (typed, time‑boxed)
-```yaml
-feature_flags:
-  enable_mbp_depth: { type: "bool", value: false }
-  use_new_ensemble: { type: "bool", value: true, expires_at: "2025-12-31T23:59:59Z" }
-  backtester_fast_path: { type: "enum", value: "v2", allowed: ["v1","v2"] }
-```
-
-### 8.9 Observability
-```yaml
-metrics:
-  exporter: "otlp"
-  endpoint: "https://otel.prod.ampyfin.com:4317"
-  sampling_ratio: 0.25
-logging:
-  level: "info"
-  json: true
-  redact_fields: ["*.secret", "*.api_key", "broker.alpaca.secret_key"]
-tracing:
-  enabled: true
-  propagate_traceparent: true
-```
-
-### 8.10 Security & compliance
-```yaml
-security:
-  tls_required: true
-  mutual_tls: true
-  allowed_ciphers: ["TLS_AES_128_GCM_SHA256","TLS_AES_256_GCM_SHA384"]
-  acls:
-    - subject: "service:ampy-oms"
-      allow_publish: ["ampy/prod/orders/v1/requests"]
-      allow_consume: ["ampy/prod/signals/v1/*"]
-    - subject: "service:broker-alpaca"
-      allow_publish: ["ampy/prod/fills/v1/events"]
-      allow_consume: ["ampy/prod/orders/v1/requests"]
-  pii_policy: "forbid"
-```
+- Durations as strings: `150ms`, `2s`, `5m`, `1h`  
+- Sizes as strings: `128KiB`, `1MiB`  
+- Explicit domains: `oms.*`, `ingest.*`, `broker.*`, `ml.*`, `warehouse.*`, `fx.*`, `metrics`, `logging`, `tracing`, `security.*`, `feature_flags.*`
 
 ---
 
-## 9) Secrets: Reference Grammar, Resolution, Rotation
+## Secrets (indirection, caching, rotation, redaction)
 
-**Reference forms**
+Use **references**, not literal values:
+
 - `secret://vault/<path>#<key>`
 - `aws-sm://<name>?versionStage=AWSCURRENT`
-- `gcp-sm://projects/<id>/secrets/<name>/versions/latest`
+- `gcp-sm://projects/<project>/secrets/<name>/versions/latest`
 
-**Resolution modes**
-- **Load‑time** (resolve once; cache with TTL; refresh on rotation signal).
-- **Use‑time** (resolve per access; higher latency; for short‑lived creds).
+Local development fallback file (`.secrets.local.json`):
 
-**Rotation triggers**
-- Secret backend event → publish `SecretRotated` on control topic.
-- Scheduled rotations with staggered rollouts.
-
-**Redaction**
-- Replace values with `***` in logs/metrics; optionally log key fingerprints (non‑reversible) for correlation.
-
----
-
-## 10) Runtime Reload via Control‑Plane (Preview → Apply → Confirm)
-
-1. **Preview**: Publish `ConfigPreviewRequested` with candidate overlay, targets, and expiry.
-2. **Apply**: If validation passes, publish `ConfigApply` with `change_id`, canary percent/duration, and deadline.
-3. **Confirm**: Services emit `ConfigApplied` (success) or `ConfigRejected` (reasons). Automatic rollback on threshold failure.
-
-**Abridged example (payload semantics only):**
 ```json
 {
-  "change_id": "chg_20250905_1142",
-  "targets": ["oms.risk.max_order_notional_usd"],
-  "candidate": {"oms":{"risk":{"max_order_notional_usd":70000}}},
-  "canary": {"percent": 10, "duration": "10m"},
-  "global_deadline": "2025-09-05T17:00:00Z"
+  "secret://vault/tiingo#token": "TIINGO_LOCAL_DEV_TOKEN",
+  "aws-sm://ALPACA_SECRET?versionStage=AWSCURRENT": "ALPACA_LOCAL_DEV_SECRET",
+  "gcp-sm://projects/demo/secrets/AMPY_API/versions/latest": "AMPY_LOCAL_DEV_API"
 }
 ```
 
----
-
-## 11) Safety & Failure Modes
-
-- **Fail‑shut** (critical domains: OMS risk, broker creds): invalid → refuse to start or rollback.
-- **Fail‑open** (non‑critical domains: metrics sampling): continue with last‑known‑good + alert.
-- **Quarantine**: Unknown/extra keys are rejected or quarantined by policy; always warn.
-- **Churn circuit‑breaker**: Excess reloads halt further changes and page on‑call.
+Secrets are **always redacted** in logs/metrics/traces; rotation is signaled via `secret_rotated` events.
 
 ---
 
-## 12) Reproducibility & Audit
+## CLI usage
 
-- **Audit record**: Actor, ticket/approval ref, diffs, validation outcome, canary results, rollbacks, affected services.
-- **Point‑in‑time materialization**: Given `{run_id, timestamp}`, reconstruct effective config to reproduce behavior in paper/sim.
-- **Trace correlation**: Attach `trace_id` to preview/apply and per‑service reload spans.
+All commands are available via `python -m ampy_config.cli …` (works without global entrypoints).
 
----
+### Render effective config
 
-## 13) Usage Examples (LLM‑oriented, no implementation code)
+```bash
+python -m ampy_config.cli render   --profile dev   --resolve-secrets redacted   --provenance
+```
 
-> These are workflows that the library must enable; they specify IO/behavior, not code.
+Write it to a file:
 
-### Example A — Effective config at startup
-- Inputs: defaults + `prod` profile + `us-east-1` overlay + ENV.
-- Behavior: Build effective tree with provenance; validate types/units; resolve secrets with TTL cache; expose read‑only view.
+```bash
+python -m ampy_config.cli render   --profile dev   --resolve-secrets redacted   --output /tmp/effective.yaml
+```
 
-### Example B — Temporary runtime override (risk tightening)
-- Inputs: `ConfigPreviewRequested` with candidate `{ oms.risk.max_order_notional_usd=70000 }`, expiry `18:00Z`.
-- Behavior: Validate, canary apply (10%), then ramp to 100% if healthy; at expiry, revert to prior value.
+Resolve **values** (dev only; requires `.secrets.local.json` or configured backends):
 
-### Example C — Secret rotation
-- Inputs: `SecretRotated` for `aws-sm://ALPACA_SECRET#value`.
-- Behavior: Invalidate cache; re‑resolve; atomically update consumers; publish `ConfigApplied` with affected services.
+```bash
+AMPY_CONFIG_LOCAL_SECRETS=.secrets.local.json python -m ampy_config.cli render --profile dev --resolve-secrets values
+```
 
-### Example D — Incident reconstruction
-- Inputs: `{ run_id="run_2025-09-05T16:12Z", timestamp="2025-09-05T16:12:30Z" }`.
-- Behavior: Materialize exact effective config; export as JSON/YAML for audit; link to change journal and bus message IDs.
+### Validate (schema + semantic checks)
 
-### Example E — ENV mapping conventions
-- `OMS_RISK_MAX_ORDER_NOTIONAL_USD` ↔ `oms.risk.max_order_notional_usd`
-- `INGEST_YFINANCE_RATE_LIMIT_QPS` ↔ `ingest.yfinance.rate_limit_qps`
-- Rules: upper‑snake; dot → underscore; numeric/string parsing with units; explicit allow‑list.
+```bash
+python tools/validate.py examples/dev.yaml
+# Or explicitly:
+python tools/validate.py --schema schema/ampy-config.schema.json examples/*.yaml
+```
 
----
+### Secrets utilities
 
-## 14) Validation Rules (illustrative set)
+```bash
+# Resolve (redacted by default)
+python -m ampy_config.cli secret get "aws-sm://ALPACA_SECRET?versionStage=AWSCURRENT"
 
-- `oms.risk.max_drawdown_halt_bp`: integer ∈ [50, 1000]. Default 300.
-- `oms.throt.min_inter_order_delay`: duration ∈ [0ms, 1s]; prod min 5ms.
-- `ml.model_server.inference_timeout`: duration ∈ [10ms, 2s]; must exceed network p99.
-- `bus.max_payload_size`: size ∈ [64KiB, 5MiB]; require `compression_threshold < max_payload_size`.
-- `broker.alpaca.base_url`: must match `^https://`.
-- `feature_flags.*.type`: enum in {bool, int, enum}; optional `expires_at` ISO‑8601; expired flags revert to default.
+# Print plain (development only)
+python -m ampy_config.cli secret get --plain "secret://vault/tiingo#token"
 
----
+# Invalidate cache entry
+python -m ampy_config.cli secret rotate "gcp-sm://projects/demo/secrets/AMPY_API/versions/latest"
+```
 
-## 15) Observability
+### Run the agent
 
-- **Metrics (examples)**
-  - `config_load_success_total{service}`
-  - `config_load_failure_total{service,reason}`
-  - `config_reload_total{service}`
-  - `secret_resolve_latency_ms{backend}` histogram
-  - `config_redactions_total{field}`
-- **Logs**: Structured; include `change_id`, `run_id`, and diff summaries; redact secrets; include provenance.
-- **Tracing**: Control events and per‑service reload spans share `trace_id` for end‑to‑end visibility.
+```bash
+export NATS_URL="nats://127.0.0.1:4222"
+export AMPY_CONFIG_SERVICE="ampy-config-agent"
 
----
+python -m ampy_config.cli agent --profile dev
+```
 
-## 16) Success Criteria — Checklist (Definition of Done v1)
+It subscribes to:
 
-- [ ] **Typed schema** for domains in §8 finalized (types, defaults, constraints, units, safety/redaction).
-- [ ] **Layering/precedence** implemented with provenance per key.
-- [ ] **Secret reference grammar** supported with load‑time and use‑time resolution + TTL caching.
-- [ ] **Rotation workflow**: consumes `SecretRotated`; zero‑downtime updates; redaction verified.
-- [ ] **Runtime reload**: preview/apply/confirm with canary; rollback on threshold failure.
-- [ ] **Audit store**: immutable journal with actor, diffs, outcomes, run_id/timestamp linkage.
-- [ ] **Observability**: metrics/logs/traces for load/resolve/rotate/reload; alerting on failures/churn.
-- [ ] **Safety policies**: fail‑shut/open enforced; quarantine + warnings for unknown keys.
-- [ ] **Golden configs & fuzz tests**: cover types/units/precedence and negative cases.
-- [ ] **Point‑in‑time materialization** of effective config (run_id + timestamp).
+```
+ampy.dev.control.v1.config_preview
+ampy.dev.control.v1.config_apply
+ampy.dev.control.v1.secret_rotated
+```
 
----
+### Ops: preview & apply a runtime override
 
-## 17) Testing Matrix
+Create an overlay:
 
-- **Golden configs**: typical/sparse/edge for each environment.
-- **Fuzzing**: durations/sizes/ratios parsers; invalid unit handling.
-- **Precedence tests**: _defaults → profile → overlay → ENV → runtime_.
-- **Secret tests**: mocked stores; rotation; TTL expiry; redaction.
-- **Reload tests**: preview/apply/confirm happy‑path, canary, rollback; DLQ behavior via `ampy-bus`.
-- **Chaos**: drop/misorder control messages; ensure idempotence and safe rollback.
-- **Soak**: frequent reloads under load; memory/handle leak checks.
+```bash
+cat >/tmp/overlay.yaml <<'YAML'
+oms:
+  risk:
+    max_order_notional_usd: 77777
+YAML
+```
 
----
+Preview (validate only):
 
-## 18) Operational Runbooks (what operators can expect)
+```bash
+python -m ampy_config.cli ops preview   --profile dev   --overlay-file /tmp/overlay.yaml   --expires-at "2025-12-31T23:59:59Z"   --reason "intraday risk tightening"   --dry-run
+```
 
-- **Applying a runtime override**: Prepare candidate overlay, preview with expiry, canary at 10%, monitor metrics, ramp to 100%.
-- **Rotating a secret**: Rotate in backend; emit `SecretRotated`; confirm services publish `ConfigApplied`; verify no plaintext appears.
-- **Incident review**: Query audit by `run_id`/time; export effective config; diff against current; attach to RCA.
+Apply (persist) and **wait** until it’s effective in the resolved view:
+
+```bash
+python -m ampy_config.cli ops apply   --profile dev   --overlay-file /tmp/overlay.yaml   --wait-applied --timeout 20
+```
+
+Then verify:
+
+```bash
+python -m ampy_config.cli render --profile dev --runtime runtime/overrides.yaml --resolve-secrets redacted --provenance
+```
 
 ---
 
-## 19) Implementation Plan (single‑track, stepwise; LLM friendly)
+## Use from a service (Python example)
 
-1. **Define the typed keyspace** (sections in §8) with constraints/defaults/units/safety/redaction.
-2. **Build the layering engine** with provenance and ENV mapping rules.
-3. **Implement secret reference grammar** and resolver adapters (Vault, AWS SM, GSM); choose load‑time vs use‑time policies.
-4. **Wire control‑plane events** (consume/produce via `ampy-bus` topics) for preview/apply/confirm & rotation.
-5. **Add observability hooks** (metrics/logs/traces) and the **audit journal**.
-6. **Ship golden configs & test harness** (fuzz, chaos, soak); document failure modes and runbooks.
-7. **Cut v1** once Definition of Done in §16 is satisfied.
+```python
+# examples/service_skel.py
+import asyncio, os
+from ampy_config.layering import build_effective_config
+from ampy_config.bus.ampy_bus import AmpyBus
+from ampy_config.control.events import subjects
 
-> If external credentials are required (e.g., Vault token, AWS/GCP access for secret stores), **flag early** for ops to provision non‑prod keys.
+async def main():
+    cfg, _ = build_effective_config(
+        schema_path="schema/ampy-config.schema.json",
+        defaults_path="config/defaults.yaml",
+        profile_yaml="examples/dev.yaml",
+        overlays=[],
+        service_overrides=[],
+        env_allowlist_path="env_allowlist.txt",
+        env_file=None,
+        runtime_overrides_path="runtime/overrides.yaml",
+    )
+    print("[service] max_order_notional_usd =", cfg["oms"]["risk"]["max_order_notional_usd"])
+
+    bus = AmpyBus(os.environ.get("NATS_URL"))
+    await bus.connect()
+    subs = subjects(cfg["bus"]["topic_prefix"])
+
+    async def on_apply(subject, data):
+        # Re-build after apply; in real code, you’d update state atomically & validate
+        new_cfg, _ = build_effective_config(
+            "schema/ampy-config.schema.json",
+            "config/defaults.yaml",
+            "examples/dev.yaml",
+            [], [], "env_allowlist.txt", None, "runtime/overrides.yaml"
+        )
+        print("[service] updated max_order_notional_usd =", new_cfg["oms"]["risk"]["max_order_notional_usd"])
+
+    await bus.subscribe_json(subs["apply"], on_apply)
+    while True:
+        await asyncio.sleep(1)
+
+if __name__ == "__main__":
+    os.environ.setdefault("AMPY_CONFIG_SERVICE", "ampy-service-demo")
+    os.environ.setdefault("NATS_URL", "nats://127.0.0.1:4222")
+    asyncio.run(main())
+```
+
+### Go / C++ services
+
+- Parse the **effective YAML** (rendered by ops at boot or on a schedule).
+- Subscribe to the same control-plane subjects and re-load your resolved config (or just read `runtime/overrides.yaml`) when a `config_apply` is observed.
+- Keep reloads **transactional** for safety-critical domains.
 
 ---
 
-## 20) Future Work (post‑v1)
+## Schema notes (metrics example)
 
-- **Multi‑tenant overlays** (per‑strategy, per‑account, per‑symbol lists) with precedence guarantees.
-- **UI/CLI config explorer** with provenance, diffs, and “render effective view” export.
-- **Plugin resolvers** (e.g., SOPS, Azure Key Vault, 1Password Connect).
-- **Policy as code** (OPA/Rego) checks for high‑risk changes.
-- **Schema export** to JSON Schema/OpenAPI for cross‑language validation.
+The schema allows **either** OTLP (with endpoint) **or** Prometheus (with port):
+
+```json
+"metrics": {
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "exporter": { "type": "string", "enum": ["otlp", "prom"] },
+    "endpoint": { "type": "string" },
+    "sampling_ratio": { "type": "number", "minimum": 0, "maximum": 1 },
+    "port": { "type": "integer", "minimum": 1, "maximum": 65535 }
+  },
+  "required": ["exporter"]
+}
+```
+
+Examples:
+
+```yaml
+# OTLP
+metrics:
+  exporter: otlp
+  endpoint: https://otel.dev.ampyfin.com:4317
+  sampling_ratio: 0.25
+
+# Prometheus
+metrics:
+  exporter: prom
+  port: 9464
+```
 
 ---
 
-## 21) Maintainers & Contributions
+## Environment variables
 
-- **Owner:** AmpyFin Core (Config/Control Plane)
-- **Contributions:** Welcome via PRs and design proposals; please include test updates and runbook impacts.
-- **Security:** Report potential secret/redaction issues privately to maintainers.
-
----
-
-### Appendix — ENV Naming Rules
-
-- Key path → UPPER_SNAKE: dots become underscores.
-- Only **allow‑listed** keys are mappable from ENV (to prevent surprise overrides).
-- Values parse with units; booleans accept `true|false|1|0`; lists accept comma‑separated with escaping.
-
-**Examples**
-- `OMS_RISK_MAX_ORDER_NOTIONAL_USD` ↔ `oms.risk.max_order_notional_usd`
-- `INGEST_YFINANCE_RATE_LIMIT_QPS` ↔ `ingest.yfinance.rate_limit_qps`
+- `NATS_URL` — NATS server URL (e.g., `nats://127.0.0.1:4222`).
+- `AMPY_CONFIG_SERVICE` — logical service name (used to derive durable names).
+- `AMPY_CONFIG_RUNTIME_OVERRIDES` — path for persisted runtime overrides (default: `runtime/overrides.yaml`).
+- `AMPY_CONFIG_LOCAL_SECRETS` — path to local dev secrets JSON (default: `.secrets.local.json`).
+- `AMPY_CONFIG_SECRET_TTL_MS` — secrets cache TTL in milliseconds (default: `120000`).
+- `AMPY_CONFIG_JS_FALLBACK` — set to `1` to force **direct NATS** subscription fallback (skip JetStream) if your infra doesn’t provision streams/consumers in dev.
+- **Vault**: `VAULT_ADDR`, `VAULT_TOKEN` (if using `secret://`).
+- **AWS**: `AWS_DEFAULT_REGION` + credentials (shared config/credentials files or env) if using `aws-sm://`.
+- **GCP**: `GOOGLE_APPLICATION_CREDENTIALS` pointing to a service account key if using `gcp-sm://`.
 
 ---
 
-With `ampy-config` in place, AmpyFin gains **safety, reproducibility, and velocity**: teams iterate quickly without trading off control or compliance.
+## Troubleshooting
+
+- **Agent only shows one subscription**  
+  Likely blocked while initializing a secret backend (e.g., boto3 waiting for metadata/creds).  
+  **Fix**: Unset or configure that backend properly, or run with only local secrets in dev.
+
+- **No messages consumed / timeouts**  
+  Check that `NATS_URL` points to the **correct port**, JetStream is enabled, and the `ampy-control` stream & consumers exist and filter the right subjects.
+
+- **apply says OK but value didn’t change**  
+  Verify `runtime/overrides.yaml` was written by the agent (file path via `AMPY_CONFIG_RUNTIME_OVERRIDES`) and that your service reloads config on `config_apply`.
+
+- **Schema validation passes but semantic check fails**  
+  The semantic checks (e.g., payload size vs compression threshold, min/max bounds) run after schema validation; fix the offending values called out in the error.
+
+---
+
+## Security notes
+
+- Secrets are never logged; redaction is enforced throughout the library.  
+- Prefer **fail-shut** for safety-critical domains (OMS risk, broker creds) and **fail-open** for low-risk knobs (metric sampling).  
+- Ensure access to secret backends is locked down with least privilege.
+
+---
+
+## Contributing
+
+PRs welcome! Please include tests for new config keys, validation rules, and control-plane flows.  
+Run `pytest -q` and `python tools/validate.py examples/*.yaml` before submitting.
+
+---
+
+## License
+
+Apache-2.0 (proposed). See `LICENSE` for details.
