@@ -5,6 +5,9 @@ from ..layering import build_effective_config
 from ..secrets.registry import SecretsManager
 from ..bus.ampy_bus import AmpyBus as Bus
 from .events import subjects, ConfigApplied
+from ..obs.metrics import init_metrics, inc_load_success, inc_load_failure, inc_reload, inc_apply
+from ..obs.logging import setup_logging, log_json
+from ..obs.audit import write_audit, compute_overlay_diff
 
 RUNTIME_OVERRIDES = os.environ.get("AMPY_CONFIG_RUNTIME_OVERRIDES", "runtime/overrides.yaml")
 
@@ -43,6 +46,21 @@ async def run_agent(
         env_file=env_file,
         runtime_overrides_path=RUNTIME_OVERRIDES if pathlib.Path(RUNTIME_OVERRIDES).exists() else None,
     )
+
+    # Logging & metrics
+    setup_logging(
+        level=(cfg.get("logging", {}).get("level") or "info"),
+        json_mode=bool(cfg.get("logging", {}).get("json", True)),
+        redact_patterns=(cfg.get("logging", {}).get("redact_fields") or []),
+    )
+    init_metrics(
+        exporter=(cfg.get("metrics", {}).get("exporter") or "prom"),
+        port=int((cfg.get("metrics", {}).get("port") or 9464)),
+        addr=os.environ.get("METRICS_ADDR", "0.0.0.0"),
+        service=os.environ.get("AMPY_CONFIG_SERVICE", "ampy-config"),
+    )
+    inc_load_success(service=os.environ.get("AMPY_CONFIG_SERVICE", "ampy-config"))
+
     topic_prefix = cfg["bus"]["topic_prefix"]
     subs = subjects(topic_prefix)
 
@@ -82,6 +100,7 @@ async def run_agent(
 
         errors: List[str] = []
         status = "ok"
+        inc_reload(service=os.environ.get("AMPY_CONFIG_SERVICE", "ampy-config"))
         try:
             build_effective_config(
                 schema_path=schema_path,
@@ -102,18 +121,32 @@ async def run_agent(
             except: pass
 
         if status == "ok":
-            # Persist: merge overlay into runtime/overrides.yaml with atomic write
+            # Persist: merge overlay into runtime/overrides.yaml
             p = pathlib.Path(RUNTIME_OVERRIDES)
             current = {}
             if p.exists():
                 current = yaml.safe_load(p.read_text()) or {}
             merged = deep_merge(current, overlay)
             p.parent.mkdir(parents=True, exist_ok=True)
-            
-            # Atomic write to avoid torn files
-            tmp = p.with_suffix(".tmp")
-            tmp.write_text(yaml.safe_dump(merged))
-            tmp.replace(p)  # atomic on most OS/filesystems
+            p.write_text(yaml.safe_dump(merged))
+
+        # Audit + logs
+        inc_apply(status=status)
+        try:
+            write_audit({
+                "ts": utc_now(),
+                "event": "ConfigApply",
+                "status": status,
+                "change_id": change_id,
+                "diff": compute_overlay_diff(overlay),
+                "errors": errors or None,
+                "run_id": data.get("run_id"),
+                "producer": data.get("producer"),
+            })
+        except Exception:
+            # do not crash on audit IO
+            pass
+        log_json("info", "config_apply", change_id=change_id, status=status, errors=errors or [])
 
         # Publish ConfigApplied (ok or rejected)
         evt = ConfigApplied(

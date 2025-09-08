@@ -1,0 +1,50 @@
+[build-system]
+requires = ["hatchling>=1.25.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ampy-config"
+version = "0.1.0"
+description = "Typed configuration & secrets facade for AmpyFin (layering, validation, secrets, control-plane)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "AmpyFin contributors" }]
+keywords = ["trading", "config", "secrets", "yaml", "ampyfin"]
+dependencies = [
+  "PyYAML>=6.0",
+  "jsonschema>=4.21",
+]
+
+[project.optional-dependencies]
+bus = [
+  "ampy-bus[nats]>=0.1.0",   # adjust if your published version differs
+]
+aws = ["boto3>=1.34"]
+gcp = ["google-cloud-secret-manager>=2.20"]
+vault = ["hvac>=2.1"]
+test = [
+  "pytest>=8.0",
+  "pytest-asyncio>=0.23",
+]
+
+[project.scripts]
+ampy-config = "ampy_config.cli:main"
+
+[tool.hatch.build]
+# include runtime/schema/examples so users get out-of-the-box demo configs
+include = [
+  "ampy_config/**",
+  "schema/**",
+  "config/**",
+  "examples/**",
+  "env_allowlist.txt",
+  "tools/**",
+  "Makefile",
+  "README.md",
+]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+pythonpath = ["."]
+asyncio_mode = "auto"

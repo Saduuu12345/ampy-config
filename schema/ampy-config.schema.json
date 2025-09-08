@@ -107,7 +107,30 @@
           "required":["type","value"]
         }
       },
-      "metrics":{"type":"object","additionalProperties": false,"properties":{"exporter":{"type":"string","enum":["otlp","prom"]},"endpoint":{"type":"string"},"sampling_ratio":{"type":"number","minimum":0,"maximum":1}},"required":["exporter"]},
+      "metrics": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "exporter": { "type": "string", "enum": ["prom", "otlp"] },
+            "endpoint": { "type": "string", "format": "uri" },
+            "sampling_ratio": { "type": "number", "minimum": 0, "maximum": 1 },
+            "port": { "type": "integer", "minimum": 1, "maximum": 65535 }
+        },
+        "required": ["exporter"],
+        "allOf": [
+            {
+            "if": { "properties": { "exporter": { "const": "prom" } }, "required": ["exporter"] },
+            "then": { "required": ["port"] }
+            },
+            {
+            "if": { "properties": { "exporter": { "const": "otlp" } }, "required": ["exporter"] },
+            "then": { "required": ["endpoint"] }
+            }
+        ]
+      },
+
+      
+      
       "logging":{"type":"object","additionalProperties": false,"properties":{"level":{"type":"string","enum":["debug","info","warn","error"]},"json":{"type":"boolean"},"redact_fields":{"type":"array","items":{"type":"string"}}},"required":["level"]},
       "tracing":{"type":"object","additionalProperties": false,"properties":{"enabled":{"type":"boolean"},"propagate_traceparent":{"type":"boolean"}},"required":["enabled"]},
       "security":{"type":"object","additionalProperties": false,"properties":{"tls_required":{"type":"boolean"},"mutual_tls":{"type":"boolean"},"allowed_ciphers":{"type":"array","items":{"type":"string"}},"acls":{"type":"array","items":{"type":"object","additionalProperties": false,"properties":{"subject":{"type":"string"},"allow_publish":{"type":"array","items":{"type":"string"}},"allow_consume":{"type":"array","items":{"type":"string"}}},"required":["subject"]}},"pii_policy":{"type":"string","enum":["forbid","allow"]}},"required":["tls_required","pii_policy"]}

@@ -1,7 +1,3 @@
-feature_flags:
-  use_new_ensemble:
-    type: bool
-    value: false
 oms:
   risk:
-    max_order_notional_usd: 70000
+    max_order_notional_usd: 77778

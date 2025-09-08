@@ -48,3 +48,15 @@ ops-apply:
 
 ops-rotated:
 	python3 -m ampy_config.cli ops secret-rotated --profile $(PROFILE) --reference $(REF) --rotated-at $(ROTATED_AT)
+
+.PHONY: build publish test
+build:
+	python -m build
+
+test:
+	pytest -q
+
+publish:
+	@echo "Remember to set TWINE_USERNAME/TWINE_PASSWORD or use API token"
+	python -m pip install --upgrade twine
+	twine upload dist/*

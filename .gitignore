@@ -91,3 +91,17 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+# build
+dist/
+build/
+*.egg-info/
+
+# local/dev
+.env
+.secrets.local.json
+.runtime/
+runtime/overrides.yaml
+
+# pytest
+.pytest_cache/

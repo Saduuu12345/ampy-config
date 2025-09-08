@@ -148,38 +148,38 @@ def validate_config(schema_path: str, data: Dict[str, Any]) -> None:
     # semantic checks (subset of tools/validate.py, kept in-sync)
     comp = size_to_bytes(data["bus"]["compression_threshold"])
     maxp = size_to_bytes(data["bus"]["max_payload_size"])
-    assert comp < maxp, "bus.compression_threshold must be < bus.max_payload_size"
+    assert comp < maxp, f"bus.compression_threshold ({data['bus']['compression_threshold']} = {comp} bytes) must be < bus.max_payload_size ({data['bus']['max_payload_size']} = {maxp} bytes)"
 
     dd = data["oms"]["risk"]["max_drawdown_halt_bp"]
-    assert 50 <= dd <= 1000, "oms.risk.max_drawdown_halt_bp must be in [50,1000]"
+    assert 50 <= dd <= 1000, f"oms.risk.max_drawdown_halt_bp ({dd}) must be in [50,1000] basis points"
 
     if data["bus"]["env"] == "prod":
         delay = duration_to_ms(data["oms"]["throt"]["min_inter_order_delay"])
-        assert delay >= 5, "prod: oms.throt.min_inter_order_delay must be >= 5ms"
+        assert delay >= 5, f"prod: oms.throt.min_inter_order_delay ({data['oms']['throt']['min_inter_order_delay']} = {delay}ms) must be >= 5ms"
 
     # ensemble sanity
     ens = data["ml"]["ensemble"]
-    assert ens["min_models"] <= ens["max_models"], "ml.ensemble.min_models must be <= max_models"
+    assert ens["min_models"] <= ens["max_models"], f"ml.ensemble.min_models ({ens['min_models']}) must be <= max_models ({ens['max_models']})"
 
     # feature_flags type/value coherence
     for name, flag in (data.get("feature_flags") or {}).items():
         t = flag.get("type")
         v = flag.get("value")
         if t == "bool":
-            assert isinstance(v, bool), f"feature_flags.{name}.value must be boolean"
+            assert isinstance(v, bool), f"feature_flags.{name}.value ({v}) must be boolean, got {type(v).__name__}"
         elif t == "int":
-            assert isinstance(v, int), f"feature_flags.{name}.value must be integer"
+            assert isinstance(v, int), f"feature_flags.{name}.value ({v}) must be integer, got {type(v).__name__}"
         elif t == "enum":
             allowed = flag.get("allowed") or []
-            assert allowed, f"feature_flags.{name}.allowed must be set for enum"
-            assert v in allowed, f"feature_flags.{name}.value must be one of {allowed}"
+            assert allowed, f"feature_flags.{name}.allowed must be set for enum type"
+            assert v in allowed, f"feature_flags.{name}.value ({v}) must be one of {allowed}"
 
     # alpaca enabled requires keys
     alp = data["broker"]["alpaca"]
     if alp.get("enabled"):
         for req in ("base_url","key_id","secret_key"):
-            assert alp.get(req), f"broker.alpaca.{req} required when alpaca.enabled=true"
+            assert alp.get(req), f"broker.alpaca.{req} is required when alpaca.enabled=true"
 
     # fx priorities unique
     prios = [p["priority"] for p in data["fx"]["providers"]]
-    assert len(prios) == len(set(prios)), "fx.providers priorities must be unique"
+    assert len(prios) == len(set(prios)), f"fx.providers priorities must be unique, found duplicates: {[p for p in prios if prios.count(p) > 1]}"

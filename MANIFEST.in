@@ -1,0 +1,6 @@
+include README.md
+recursive-include schema *
+recursive-include config *
+recursive-include examples *
+include env_allowlist.txt
+recursive-include tools *

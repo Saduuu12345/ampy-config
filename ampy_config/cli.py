@@ -1,11 +1,104 @@
 from __future__ import annotations
-import argparse, sys, yaml, json, asyncio, datetime
-from typing import List
+import argparse, sys, os, yaml, json, asyncio, datetime, time
+from typing import List, Optional, Dict, Any, Tuple
 from .layering import build_effective_config
 from .secrets.registry import SecretsManager, looks_like_secret_ref, walk_and_transform
 from .control.events import subjects, ConfigPreviewRequested, ConfigApply, SecretRotated
 from .control.agent import run_agent
 from .bus.ampy_bus import AmpyBus as Bus
+import asyncio
+
+# ---------- helpers for wait-applied (poll effective config) ----------
+def _flatten_overlay(prefix: str, node: Any, out: Dict[str, Any]) -> None:
+    if isinstance(node, dict):
+        for k, v in node.items():
+            _flatten_overlay(f"{prefix}.{k}" if prefix else k, v, out)
+    else:
+        out[prefix] = node
+
+def _get_by_path(cfg: Dict[str, Any], path: str) -> Tuple[bool, Any]:
+    cur: Any = cfg
+    for part in path.split("."):
+        if isinstance(cur, dict) and part in cur:
+            cur = cur[part]
+        else:
+            return False, None
+    return True, cur
+
+def _effective_matches_overlay(
+    effective: Dict[str, Any], overlay: Dict[str, Any]
+) -> Tuple[bool, Dict[str, Tuple[Any, Any]]]:
+    """
+    Returns (ok, diffs). diffs[path] = (expected_from_overlay, actual_in_effective)
+    """
+    leaves: Dict[str, Any] = {}
+    _flatten_overlay("", overlay or {}, leaves)
+    diffs: Dict[str, Tuple[Any, Any]] = {}
+    ok = True
+    for path, exp in leaves.items():
+        found, actual = _get_by_path(effective, path)
+        if not found or actual != exp:
+            ok = False
+            diffs[path] = (exp, actual if found else "<missing>")
+    return ok, diffs
+
+def _wait_until_effective(
+    *,
+    profile: str,
+    schema_path: str,
+    defaults_path: str,
+    overlays: List[str],
+    service_overrides: List[str],
+    env_allowlist_path: str,
+    env_file: str | None,
+    runtime_overrides_path: str | None,
+    expected_overlay: Dict[str, Any],
+    timeout_s: float = 10.0,
+    poll_interval_s: float = 0.5,
+) -> Tuple[bool, Dict[str, Tuple[Any, Any]]]:
+    """
+    Poll build_effective_config until all overlay leaves match the effective view,
+    or timeout. Returns (ok, diffs).
+    """
+    deadline = time.time() + timeout_s
+    last_diffs: Dict[str, Tuple[Any, Any]] = {}
+    while time.time() < deadline:
+        effective, _ = build_effective_config(
+            schema_path=schema_path,
+            defaults_path=defaults_path,
+            profile_yaml=f"examples/{profile}.yaml",
+            overlays=overlays,
+            service_overrides=service_overrides,
+            env_allowlist_path=env_allowlist_path,
+            env_file=env_file,
+            runtime_overrides_path=runtime_overrides_path,
+        )
+        ok, diffs = _effective_matches_overlay(effective, expected_overlay)
+        if ok:
+            return True, {}
+        last_diffs = diffs
+        time.sleep(poll_interval_s)
+    return False, last_diffs
+
+async def _wait_for_applied(bus, subject: str, change_id: str, timeout: float = 10.0) -> bool:
+    """
+    Subscribe temporarily to the '...config_applied' subject and wait
+    for matching change_id. Returns True if seen before timeout.
+    """
+    fut: asyncio.Future[bool] = asyncio.get_event_loop().create_future()
+
+    async def _cb(subject: str, data: dict) -> None:
+        if data.get("change_id") == change_id:
+            if not fut.done():
+                fut.set_result(True)
+
+    await bus.connect()
+    # temp durable for this wait
+    await bus.subscribe_json(subject, _cb)
+    try:
+        return await asyncio.wait_for(fut, timeout=timeout)
+    except asyncio.TimeoutError:
+        return False
 
 # -------- existing render + secret commands (unchanged) --------
 def cmd_render(args) -> int:
@@ -78,7 +171,7 @@ async def _publish(bus: Bus, subject: str, payload: dict, kind: str, dry_run: bo
         print(f"[HINT] Make sure NATS server is running and control plane agent is consuming events", file=sys.stderr)
         print(f"[HINT] Use --dry-run to test without publishing", file=sys.stderr)
         return 1
- 
+    return 0
 
 def cmd_ops_preview(args) -> int:
     # Build to fetch topic_prefix
@@ -113,11 +206,43 @@ def cmd_ops_apply(args) -> int:
         canary_percent=args.canary_percent, canary_duration=args.canary_duration,
         global_deadline=args.global_deadline, overlay=overlay, run_id=args.run_id, producer="ops-cli@1"
     ).to_dict()
-    result = asyncio.run(_publish(Bus(args.bus_url), subs["apply"], evt, kind="ConfigApply", dry_run=args.dry_run))
-    if result is not None:
-        return result
+    pub_rc = asyncio.run(_publish(Bus(args.bus_url), subs["apply"], evt, kind="ConfigApply", dry_run=args.dry_run))
+    if pub_rc:
+        return pub_rc
     if not args.dry_run:
-        print(f"[OK] apply → {subs['apply']}")
+        print(f"[OK] apply → {subs['apply']} (change_id={evt['change_id']})")
+
+    # Choose a runtime path to poll against:
+    #  - explicit --runtime if provided
+    #  - else AMPY_CONFIG_RUNTIME_OVERRIDES
+    #  - else default "runtime/overrides.yaml"
+    runtime_path = args.runtime or os.environ.get("AMPY_CONFIG_RUNTIME_OVERRIDES", "runtime/overrides.yaml")
+    if args.wait_applied and not args.dry_run:
+        print(f"[INFO] waiting for effective config via runtime='{runtime_path}'")
+
+    # Optional: wait until effective config reflects the overlay (runtime persisted)
+    if args.wait_applied and not args.dry_run:
+        ok, diffs = _wait_until_effective(
+            profile=args.profile,
+            schema_path=args.schema,
+            defaults_path=args.defaults,
+            overlays=args.overlay,
+            service_overrides=args.service_override,
+            env_allowlist_path=args.env_allowlist,
+            env_file=args.env_file,
+            runtime_overrides_path=runtime_path,
+            expected_overlay=overlay or {},
+            timeout_s=args.timeout,
+            poll_interval_s=args.poll_interval,
+        )
+        if ok:
+            print(f"[OK] applied confirmed in effective config (change_id={evt['change_id']})")
+            return 0
+        else:
+            print("[ERROR] timed out waiting for overlay to be effective:", file=sys.stderr)
+            for path, (exp, got) in diffs.items():
+                print(f"  - {path}: expected={exp!r} got={got!r}", file=sys.stderr)
+            return 1
     return 0
 
 def cmd_ops_secret_rotated(args) -> int:
@@ -211,6 +336,9 @@ def main(argv: List[str] | None = None) -> int:
     a.add_argument("--global-deadline", default=None)
     a.add_argument("--run-id", default=None)
     a.add_argument("--bus-url", default=None)
+    a.add_argument("--wait-applied", action="store_true", help="Wait until effective config reflects the overlay")
+    a.add_argument("--timeout", type=float, default=10.0, help="Seconds to wait with --wait-applied (default: 10)")
+    a.add_argument("--poll-interval", type=float, default=0.5, help="Polling interval seconds (default: 0.5)")
     a.add_argument("--dry-run", action="store_true", help="Show what would be published without actually publishing")
     a.set_defaults(func=cmd_ops_apply)
 
