@@ -1,4 +1,7 @@
 feature_flags:
   use_new_ensemble:
-    type: "bool"
+    type: bool
     value: false
+oms:
+  risk:
+    max_order_notional_usd: 70000

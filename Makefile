@@ -35,3 +35,16 @@ render-redacted:
 
 render-values:
 	python3 -m ampy_config.cli render --profile $(PROFILE) --resolve-secrets values --provenance
+
+.PHONY: agent ops-preview ops-apply ops-rotated
+agent:
+	python3 -m ampy_config.cli agent --profile $(PROFILE)
+
+ops-preview:
+	python3 -m ampy_config.cli ops preview --profile $(PROFILE) --overlay-file $(OVERLAY_FILE) --expires-at $(EXPIRES_AT) --reason "$(REASON)"
+
+ops-apply:
+	python3 -m ampy_config.cli ops apply --profile $(PROFILE) --overlay-file $(OVERLAY_FILE) --change-id $(CHANGE_ID) --canary-percent $(CANARY_PCT) --canary-duration $(CANARY_DUR)
+
+ops-rotated:
+	python3 -m ampy_config.cli ops secret-rotated --profile $(PROFILE) --reference $(REF) --rotated-at $(ROTATED_AT)

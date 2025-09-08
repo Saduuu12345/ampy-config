@@ -3,3 +3,5 @@ jsonschema
 hvac
 boto3
 google-cloud-secret-manager
+nats-py
+ampy-bus
