@@ -64,7 +64,9 @@ Without a unified configuration layer, distributed trading systems tend to devel
 
 ---
 
-## 🚀 Install (Python / PyPI)
+## 🚀 Install
+
+### 🐍 Python / PyPI
 
 ```bash
 pip install ampy-config
@@ -74,6 +76,21 @@ pip install ampy-config
 ```bash
 pip install -e .
 ```
+
+### 🐹 Go Client
+
+**Library:**
+```bash
+go get github.com/AmpyFin/ampy-config/go/ampyconfig@v0.1.0
+```
+
+**Binaries:**
+```bash
+cd go/ampyconfig
+make     # builds bin/ampyconfig-{ops,agent,listener}
+```
+
+> 📦 **Available on [pkg.go.dev](https://pkg.go.dev/github.com/AmpyFin/ampy-config/go/ampyconfig)**
 
 ### 🔧 Optional secret backends
 
@@ -328,6 +345,41 @@ if __name__ == "__main__":
     os.environ.setdefault("NATS_URL", "nats://127.0.0.1:4222")
     asyncio.run(main())
 ```
+
+### 🐹 Go Client Usage
+
+**Start the agent:**
+```bash
+./bin/ampyconfig-agent \
+  -nats "$NATS_URL" \
+  -topic ampy/dev \
+  -runtime runtime/overrides.yaml \
+  -service ampy-config-agent \
+  -log info
+```
+
+**Apply configuration changes:**
+```bash
+cat >/tmp/overlay.yaml <<'YAML'
+oms:
+  risk:
+    max_order_notional_usd: 123456
+YAML
+
+./bin/ampyconfig-ops \
+  -nats "$NATS_URL" \
+  -topic ampy/dev \
+  -overlay-file /tmp/overlay.yaml \
+  -wait-applied -timeout 20 \
+  -runtime runtime/overrides.yaml
+```
+
+**Available binaries:**
+- `ampyconfig-ops` — publish `config_preview`, `config_apply`, `secret_rotated`
+- `ampyconfig-agent` — consume control events and persist `runtime/overrides.yaml`
+- `ampyconfig-listener` — example service listener that reacts to changes
+
+> 📝 **Status:** v0 thin client — Python `ampy-config` remains the source of truth for schema validation and layering. This Go module focuses on control-plane parity and operational UX.
 
 ### 🌐 Go / C++ services
 
