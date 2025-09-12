@@ -2,7 +2,7 @@ module github.com/AmpyFin/ampy-config/go/ampyconfig
 
 go 1.22
 
-// Version: v1.1.4
+// Version: v1.1.5
 
 require (
 	github.com/nats-io/nats.go v1.35.0

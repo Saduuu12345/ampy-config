@@ -109,7 +109,7 @@ pip install -e .
 
 **Library:**
 ```bash
-go get github.com/AmpyFin/ampy-config/go/ampyconfig@v1.1.4
+go get github.com/AmpyFin/ampy-config/go/ampyconfig@v1.1.5
 ```
 
 **Binaries:**
